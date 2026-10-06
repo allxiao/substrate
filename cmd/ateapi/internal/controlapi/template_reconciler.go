@@ -122,7 +122,7 @@ func (r *ActorTemplateReconciler) resync(ctx context.Context) {
 		}
 		for _, tmpl := range page.Items {
 			ref := resources.ActorTemplateRefFromActorTemplate(tmpl)
-			if goldenSnapshotDone(tmpl.GetStatus().GetGoldenSnapshotStatus()) {
+			if !tmpl.GetColdStart() && goldenSnapshotDone(tmpl.GetStatus().GetGoldenSnapshotStatus()) {
 				slog.DebugContext(ctx, "Skipping actor template with terminal golden snapshot status", slog.String("ActorTemplate", ref.String()))
 			} else {
 				r.queue.Add(ref)
@@ -188,6 +188,27 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 			return 0, nil
 		}
 		return 0, err
+	}
+
+	if tmpl.GetColdStart() {
+		preloader, ok := r.control.(templateImagePreloader)
+		if !ok {
+			return 0, fmt.Errorf("cold templates require an image preloader")
+		}
+		preloadStatus, preloadErr := preloader.PreloadActorTemplate(ctx, tmpl)
+		if preloadStatus != nil {
+			_, err := r.persistence.UpdateActorTemplate(ctx, ref, store.PreconditionFrom(tmpl), func(current *ateapipb.ActorTemplate) error {
+				if current.Status == nil {
+					current.Status = &ateapipb.ActorTemplateStatus{}
+				}
+				current.Status.ImagePreloadStatus = preloadStatus
+				return nil
+			})
+			if err != nil {
+				return 0, err
+			}
+		}
+		return r.resyncInterval, preloadErr
 	}
 
 	goldenActorRef := &ateapipb.ObjectRef{

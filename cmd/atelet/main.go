@@ -33,6 +33,7 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/ateletpath"
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/credentialprovider"
+	"github.com/agent-substrate/substrate/cmd/atelet/internal/snapshotcache"
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/sparsefile"
 	"github.com/agent-substrate/substrate/internal/actorlog"
 	"github.com/agent-substrate/substrate/internal/apierror"
@@ -40,6 +41,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/atelet"
+	"github.com/agent-substrate/substrate/internal/azureauth"
 	"github.com/agent-substrate/substrate/internal/clustertrustbundle"
 	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/imagecache"
@@ -103,6 +105,7 @@ var (
 
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
 	imageCacheDir                = pflag.String("image-cache-dir", ateletpath.ImageCacheDir, "Directory for the node-local OCI image layer cache. Must be on the volume shared with the ateom pods (the cached layers are their overlay lowerdirs), and on a disk sized for both capacity and IOPS: unpack throughput is gated by the volume's IOPS.")
+	dataSnapshotCacheMaxBytes    = pflag.Int64("data-snapshot-cache-max-bytes", 256<<20, "Maximum bytes of immutable external Data snapshots retained on this node; 0 disables caching.")
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
 	logLevelFlag = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
@@ -214,6 +217,21 @@ func main() {
 		}
 		imageCredsKeychain = kc
 	}
+	if endpoint := os.Getenv("ATE_AZURE_ACR_ENDPOINT"); endpoint != "" {
+		credential, err := azureauth.NewCredential(os.Getenv("ATE_AZURE_ACR_CLIENT_ID"))
+		if err != nil {
+			serverboot.Fatal(ctx, "Failed to configure Azure ACR identity", err)
+		}
+		keychain, err := azureauth.NewACRKeychain(endpoint, credential)
+		if err != nil {
+			serverboot.Fatal(ctx, "Failed to configure Azure ACR authentication", err)
+		}
+		if imageCredsKeychain == nil {
+			imageCredsKeychain = keychain
+		} else {
+			imageCredsKeychain = authn.NewMultiKeychain(keychain, imageCredsKeychain)
+		}
+	}
 
 	if err := validateImageCacheGCFlags(); err != nil {
 		serverboot.Fatal(ctx, "Invalid image cache GC flags", err)
@@ -240,6 +258,12 @@ func main() {
 	var wrappedGCS objectstorage.ObjectStorage
 	storageBackend := os.Getenv("ATE_STORAGE_BACKEND")
 	switch storageBackend {
+	case "azure":
+		client, _, err := azureauth.NewBlobClient()
+		if err != nil {
+			serverboot.Fatal(ctx, "Failed to configure Azure Blob storage", err)
+		}
+		wrappedGCS = objectstorage.NewAzureClient(client)
 	case "s3":
 		slog.InfoContext(ctx, "Using S3 storage backend")
 		// depend on standard AWS environment variables to configure the client
@@ -254,11 +278,13 @@ func main() {
 			}
 		}))
 	// GCS is currently the default, TODO: we assume workload identity / ADC
-	default:
+	case "", "gcs":
 		wrappedGCS, err = objectstorage.NewGCSClient(ctx)
 		if err != nil {
 			serverboot.Fatal(ctx, "Failed to create GCS client", err)
 		}
+	default:
+		serverboot.Fatal(ctx, "Unsupported storage backend", fmt.Errorf("unknown ATE_STORAGE_BACKEND %q", storageBackend))
 	}
 
 	volPlugins := make(map[string]volume.VolumePluginWorkerPlane)
@@ -313,6 +339,9 @@ func main() {
 		csiDriverConfigLister,
 		systemInfoVolumes,
 	)
+	if *dataSnapshotCacheMaxBytes > 0 {
+		wmService.snapshotCache = snapshotcache.New(filepath.Join(nodepath.BasePath, "snapshot-cache"), *dataSnapshotCacheMaxBytes)
+	}
 	go systemInfoVolumes.run(ctx)
 
 	// Pre-download sandbox assets as SandboxConfigs appear/change so the first
@@ -450,6 +479,7 @@ type AteomHerder struct {
 
 	ateomDialer           *AteomDialer
 	imageCache            *imagecache.Store
+	snapshotCache         *snapshotcache.Store
 	anonGCSClient         objectstorage.ObjectStorage
 	gcsClient             objectstorage.ObjectStorage
 	instruments           *Instruments
@@ -909,6 +939,7 @@ func (s *AteomHerder) uploadSnapshot(ctx context.Context, uri resources.Snapshot
 	if err := objectstorage.SendBytesToGCS(ctx, s.gcsClient, manifestURI, manifest); err != nil {
 		return fmt.Errorf("while uploading snapshot manifest: %w", err)
 	}
+	s.cacheDataSnapshot(ctx, uri.String(), srcDir, rec, manifest)
 	return nil
 }
 
@@ -1123,6 +1154,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		}
 	}()
 	var sandboxRec *sandboxAssetsRecord
+	var externalManifest []byte
 	switch req.GetType() {
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
 		uri, err := resources.ParseSnapshotURI(req.GetExternalConfig().GetSnapshotUri())
@@ -1133,10 +1165,17 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		if err != nil {
 			return nil, err
 		}
-		manifest, err := objectstorage.FetchFromGCS(ctx, s.gcsClient, manifestURI)
-		if err != nil {
-			return nil, fmt.Errorf("while fetching snapshot manifest: %w", err)
+		var manifest []byte
+		if s.snapshotCache != nil && req.GetScope() == ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA {
+			manifest, _ = s.snapshotCache.Manifest(uri.String())
 		}
+		if manifest == nil {
+			manifest, err = objectstorage.FetchFromGCS(ctx, s.gcsClient, manifestURI)
+			if err != nil {
+				return nil, fmt.Errorf("while fetching snapshot manifest: %w", err)
+			}
+		}
+		externalManifest = manifest
 		if sandboxRec, err = unmarshalSandboxRecord(manifest); err != nil {
 			return nil, fmt.Errorf("while unmarshalling sandbox record: %w", err)
 		}
@@ -1186,9 +1225,16 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		}()
 		switch req.GetType() {
 		case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
+			if s.snapshotCache != nil && req.GetScope() == ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA {
+				if err := s.snapshotCache.Restore(gctx, req.GetExternalConfig().GetSnapshotUri(), checkpointDir, sandboxRec.SnapshotFiles); err == nil {
+					slog.InfoContext(gctx, "Data snapshot cache hit", slog.String("snapshot_uri", req.GetExternalConfig().GetSnapshotUri()))
+					return nil
+				}
+			}
 			if err := s.downloadExternalCheckpoint(gctx, req.GetExternalConfig().GetSnapshotUri(), checkpointDir, sandboxRec.SnapshotFiles); err != nil {
 				return err
 			}
+			s.cacheDataSnapshot(gctx, req.GetExternalConfig().GetSnapshotUri(), checkpointDir, sandboxRec, externalManifest)
 		case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
 			// Restore in place from LocalSnapshotDir; no staging.
 			if err := checkLocalSnapshotFiles(checkpointDir, sandboxRec.SnapshotFiles); err != nil {

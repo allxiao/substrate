@@ -1,0 +1,123 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ate-api-server
+  namespace: ate-system
+  annotations:
+    azure.workload.identity/client-id: e97ebd23-314e-4a01-8a89-54d36da6c26f
+    azure.workload.identity/tenant-id: 72f988bf-86f1-41af-91ab-2d7cd011db47
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: atelet
+  namespace: ate-system
+  annotations:
+    azure.workload.identity/client-id: e97ebd23-314e-4a01-8a89-54d36da6c26f
+    azure.workload.identity/tenant-id: 72f988bf-86f1-41af-91ab-2d7cd011db47
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ate-api-server
+  namespace: ate-system
+spec:
+  template:
+    metadata:
+      labels:
+        azure.workload.identity/use: "false"
+    spec:
+      containers:
+      - name: ate-api-server
+        volumeMounts:
+        - name: azure-workload-token
+          mountPath: /var/run/secrets/azure/tokens
+          readOnly: true
+        env:
+        - name: AZURE_CLIENT_ID
+          value: e97ebd23-314e-4a01-8a89-54d36da6c26f
+        - name: AZURE_TENANT_ID
+          value: 72f988bf-86f1-41af-91ab-2d7cd011db47
+        - name: AZURE_FEDERATED_TOKEN_FILE
+          value: /var/run/secrets/azure/tokens/token
+        - name: AZURE_AUTHORITY_HOST
+          value: https://login.microsoftonline.com/
+        - name: ATE_STORAGE_BACKEND
+          value: azure
+        - name: ATE_AZURE_STORAGE_ENDPOINT
+          value: https://menxiaosubstrate1005.blob.core.windows.net/
+        - name: ATE_AZURE_STORAGE_CLIENT_ID
+          value: e97ebd23-314e-4a01-8a89-54d36da6c26f
+        - name: ATE_AZURE_POSTGRES_CLIENT_ID
+          value: e7b80ffc-88e7-4b5f-a355-b91f2dfa14d2
+      volumes:
+      - name: azure-workload-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: api://AzureADTokenExchange
+              expirationSeconds: 3600
+              path: token
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: atelet-${SUBSTRATE_VERSION_SUFFIX}
+  namespace: ate-system
+spec:
+  template:
+    metadata:
+      labels:
+        azure.workload.identity/use: "false"
+    spec:
+      containers:
+      - name: atelet
+        volumeMounts:
+        - name: azure-workload-token
+          mountPath: /var/run/secrets/azure/tokens
+          readOnly: true
+        env:
+        - name: AZURE_CLIENT_ID
+          value: e97ebd23-314e-4a01-8a89-54d36da6c26f
+        - name: AZURE_TENANT_ID
+          value: 72f988bf-86f1-41af-91ab-2d7cd011db47
+        - name: AZURE_FEDERATED_TOKEN_FILE
+          value: /var/run/secrets/azure/tokens/token
+        - name: AZURE_AUTHORITY_HOST
+          value: https://login.microsoftonline.com/
+        - name: ATE_STORAGE_BACKEND
+          value: azure
+        - name: ATE_AZURE_STORAGE_ENDPOINT
+          value: https://menxiaosubstrate1005.blob.core.windows.net/
+        - name: ATE_AZURE_STORAGE_CLIENT_ID
+          value: e97ebd23-314e-4a01-8a89-54d36da6c26f
+        - name: ATE_AZURE_ACR_ENDPOINT
+          value: https://menxiaosubstrate1005.azurecr.io
+        - name: ATE_AZURE_ACR_CLIENT_ID
+          value: b2dd1f5d-5581-4d07-9f2d-d27c4c9d1384
+      volumes:
+      - name: image-credential-provider-bin
+        $patch: delete
+      - name: image-credential-provider-config
+        $patch: delete
+      - name: azure-workload-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: api://AzureADTokenExchange
+              expirationSeconds: 3600
+              path: token

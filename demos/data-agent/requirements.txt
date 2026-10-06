@@ -1,0 +1,5 @@
+agent-framework-core==1.20.0
+agent-framework-hosting==1.0.0a260730
+agent-framework-hosting-responses==1.0.0a261002
+fastapi==0.141.1
+uvicorn==0.54.0

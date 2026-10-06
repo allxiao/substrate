@@ -45,6 +45,14 @@ service AteomSupport {
   rpc RequestActorSuspend(RequestActorSuspendRequest) returns (RequestActorSuspendResponse) {}
 }
 
+message PreloadImageRequest {
+  string image = 1;
+  string pin_owner = 2;
+  int64 pin_ttl_seconds = 3;
+}
+
+message PreloadImageResponse {}
+
 message SetWorkerCapacityRequest {
   // What the worker can supply. atelet converts it to the control plane's
   // WorkerResources when forwarding.
@@ -159,6 +167,7 @@ message MintActorCertificateResponse {
 // Called by ate-api-server over cluster networking.  ate-api-server
 // authenticates with its k8s pod identity mTLS certificate.
 service AteomHerder {
+  rpc PreloadImage(PreloadImageRequest) returns (PreloadImageResponse) {}
   // Run tells atelet to create a new containerized workload from scratch on an
   // ateom.
   rpc Run(RunRequest) returns (RunResponse) {}

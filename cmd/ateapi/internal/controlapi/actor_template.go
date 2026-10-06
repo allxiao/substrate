@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
+	"strings"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/apivalidation"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/defaults"
@@ -37,6 +39,9 @@ func (s *RPCService) CreateActorTemplate(ctx context.Context, req *ateapipb.Crea
 	if in != nil { // otherwise validation will flag it
 		scrubResourceMetadataForCreate(in.Metadata)
 		in.Status = nil
+		if err := applyColdTemplateDefaults(in); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
 		defaults.Apply(in)
 	}
 
@@ -65,6 +70,61 @@ func (s *RPCService) CreateActorTemplate(ctx context.Context, req *ateapipb.Crea
 	}
 
 	return stored, nil
+}
+
+func applyColdTemplateDefaults(template *ateapipb.ActorTemplate) error {
+	if !template.GetColdStart() {
+		return nil
+	}
+	if template.GetSandboxConfig().GetSandboxClass() != ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM || len(template.GetContainers()) != 1 || template.Containers[0] == nil {
+		return fmt.Errorf("cold_start requires one microVM application container")
+	}
+	if template.HomeDirectory == "" {
+		template.HomeDirectory = "/root"
+	}
+	home := template.HomeDirectory
+	if !path.IsAbs(home) || path.Clean(home) != home || home == "/" || strings.ContainsAny(home, ":\x00\n\r") {
+		return fmt.Errorf("home_directory must be a clean absolute directory other than root")
+	}
+	if template.SnapshotConfig == nil {
+		template.SnapshotConfig = &ateapipb.SnapshotConfig{}
+	}
+	for _, scope := range []*ateapipb.SnapshotContentScope{&template.SnapshotConfig.OnPause, &template.SnapshotConfig.OnCommit} {
+		if *scope == ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED {
+			*scope = ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA
+		}
+		if *scope != ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA {
+			return fmt.Errorf("cold_start requires Data snapshots on pause and commit")
+		}
+	}
+	var hasHome bool
+	for _, volume := range template.Volumes {
+		if volume.GetName() == "home" && volume.GetDurableDir() != nil {
+			hasHome = true
+			continue
+		}
+		if volume.GetSystemInfo() == nil {
+			return fmt.Errorf("cold_start persists only the home durable-dir volume")
+		}
+	}
+	if !hasHome {
+		template.Volumes = append(template.Volumes, &ateapipb.Volume{Name: "home", DurableDir: &ateapipb.DurableDirVolumeSource{}})
+	}
+	var mounted bool
+	for _, mount := range template.Containers[0].VolumeMounts {
+		if mount.GetName() == "home" {
+			if mount.GetMountPath() != home {
+				return fmt.Errorf("home volume must mount at home_directory")
+			}
+			mounted = true
+		} else if mount.GetMountPath() == home {
+			return fmt.Errorf("home_directory conflicts with another volume")
+		}
+	}
+	if !mounted {
+		template.Containers[0].VolumeMounts = append(template.Containers[0].VolumeMounts, &ateapipb.VolumeMount{Name: "home", MountPath: home})
+	}
+	return nil
 }
 
 func (s *ServiceImpl) CreateActorTemplate(ctx context.Context, inTemplate *ateapipb.ActorTemplate) (*ateapipb.ActorTemplate, error) {

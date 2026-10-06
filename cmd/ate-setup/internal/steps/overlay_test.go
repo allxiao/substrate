@@ -15,6 +15,7 @@
 package steps
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -329,6 +330,31 @@ func extProcCluster(filter map[string]any) string {
 func TestSystemOverlayDefaultIsBase(t *testing.T) {
 	if got := SystemOverlay(&config.Config{Router: config.RouterEnvoy}); got != installDir+"/base" {
 		t.Errorf("SystemOverlay(envoy, GKE) = %q, want %s/base", got, installDir)
+	}
+}
+
+func TestAzureDataDevOverlay(t *testing.T) {
+	for _, router := range []string{config.RouterEnvoy, config.RouterAgentgateway} {
+		cfg := &config.Config{Root: repoRoot(t), Router: router, AzureDev: true}
+		manifest, err := (&Env{Cfg: cfg}).render(cfg.Path(SystemOverlay(cfg)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(manifest, []byte("ATE_AZURE_POSTGRES_CLIENT_ID")) || !bytes.Contains(manifest, []byte("azure.workload.identity/use")) {
+			t.Fatal("Azure identity configuration was not rendered")
+		}
+		if bytes.Contains(manifest, []byte("--image-credential-provider-config=")) {
+			t.Fatal("GKE credential-provider arguments remain in Azure overlay")
+		}
+		if bytes.Contains(manifest, []byte("cri_auth_config.yaml")) || bytes.Contains(manifest, []byte("kind: PodMonitoring")) {
+			t.Fatal("GCP-only resources remain in Azure overlay")
+		}
+		if !bytes.Contains(manifest, []byte("mountPath: /var/lib/kubelet/device-plugins")) || !bytes.Contains(manifest, []byte("mountPath: /host/dev")) {
+			t.Fatal("atelet device mounts were removed with credential mounts")
+		}
+		if !bytes.Contains(manifest, []byte("audience: api://AzureADTokenExchange")) || !bytes.Contains(manifest, []byte("AZURE_FEDERATED_TOKEN_FILE")) || !bytes.Contains(manifest, []byte("podCertificate:")) {
+			t.Fatal("manual WI or native PodCertificate projection is missing")
+		}
 	}
 }
 

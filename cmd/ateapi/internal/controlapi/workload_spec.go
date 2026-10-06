@@ -138,10 +138,22 @@ func workloadSpecFromActorTemplate(actorTemplate *ateapipb.ActorTemplate, actor 
 			Resources:       ctrResources,
 		}
 		for _, env := range ctr.GetEnv() {
+			if actorTemplate.GetColdStart() && (env.GetName() == "HOME" || env.GetName() == "FOUNDRY_SESSION_ID") {
+				continue
+			}
 			ateletCtr.Env = append(ateletCtr.Env, &ateletpb.EnvEntry{
 				Name:  env.GetName(),
 				Value: env.GetValue(),
 			})
+		}
+		if actorTemplate.GetColdStart() {
+			if actor.GetMetadata().GetUid() == "" {
+				return nil, fmt.Errorf("cold_start requires a persisted Actor UID")
+			}
+			ateletCtr.Env = append(ateletCtr.Env,
+				&ateletpb.EnvEntry{Name: "HOME", Value: actorTemplate.GetHomeDirectory()},
+				&ateletpb.EnvEntry{Name: "FOUNDRY_SESSION_ID", Value: actor.GetMetadata().GetUid()},
+			)
 		}
 		for _, mount := range ctr.GetVolumeMounts() {
 			ateletCtr.VolumeMounts = append(ateletCtr.VolumeMounts, &ateletpb.VolumeMount{

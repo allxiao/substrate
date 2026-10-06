@@ -57,7 +57,7 @@ anywhere.
 ## On-disk layout
 
 ```
-<cache-root>/                        default: /var/lib/ate/image-cache
+<cache-root>/                        default: /var/lib/ate/image-cache-v2
   version                            layout version marker ("1")
   layers/sha256/<diffid-hex>/
       fs/                            the unpacked layer tree (an overlay lowerdir)
@@ -80,6 +80,23 @@ Startup recovery (`New`) sweeps leftover `.tmp-*` and `.rm-*` dirs,
 verifies the layout version, and reclaims orphaned layers (see Garbage
 collection below). An "image" is nothing but a manifest record listing
 layer diffIDs in order — layers shared by N images exist once.
+
+### Cache Generation Migration
+
+The default root is `image-cache-v2` because the previous unpacker discarded
+regular-file modification times, invalidating timestamp-based Python bytecode.
+The current unpacker restores each regular file's tar mtime, including
+nanoseconds, through `os.Root`. The layout version remains `1`; this is a new
+cache generation, not a different directory format.
+
+Upgrade atelet one node at a time and prewarm images into the new root before
+resuming workloads. Existing layer digests do not prove extraction metadata
+is correct, so do not reuse the old root or repair shared layers in place.
+An explicit `--image-cache-dir` must likewise point to a fresh generation on
+the shared volume. Keep the old tree while running/paused workloads, overlay
+specs or retained Full snapshots may still reference its absolute paths.
+Remove it only after verifying those references are gone; rollback before
+new workload activation can restore the previous binary and cache root.
 
 ## Pull path (atelet: `Store.EnsureImage`)
 
@@ -255,10 +272,14 @@ undefined, and doesn't even free the space until the mount goes away.
 Deleting the cache root by hand (while no actors are starting) remains
 safe — the store re-pulls whatever is missing.
 
-This is Phase 2 of [#463](https://github.com/agent-substrate/substrate/issues/463);
-the watermark loop, flags, and cache metrics complete it. Phase 3 adds
-the control-plane surface (reporting cached digests for scheduling
-affinity, and a `PreloadImage` API with expiring pins). The
+The watermark loop, flags, and cache metrics cover Phase 2 of
+[#463](https://github.com/agent-substrate/substrate/issues/463). Cold-start
+ActorTemplates now use atelet's authenticated `PreloadImage` API and
+Store-owned expiring pins. Reconciliation preloads every known atelet node,
+including nodes with no worker yet, and reports completion in template status.
+Pins root both image records and their layers during eviction and survive
+atelet restart. Cached-digest scheduling affinity and P2P distribution remain
+future work. The
 layer-materializer seam is also designed so a lazy-pull backend
 (eStargz/SOCI-style FUSE) can replace the untar backend later without
 restructuring.

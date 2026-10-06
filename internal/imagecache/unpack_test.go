@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 type tarEntry struct {
@@ -31,6 +32,8 @@ type tarEntry struct {
 	mode     int64
 	body     string
 	linkname string
+	modTime  time.Time
+	format   tar.Format
 }
 
 func defaultMode(typeflag byte) int64 {
@@ -59,6 +62,8 @@ func buildTar(t *testing.T, entries []tarEntry) []byte {
 			Mode:     mode,
 			Size:     int64(len(e.body)),
 			Linkname: e.linkname,
+			ModTime:  e.modTime,
+			Format:   e.format,
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			t.Fatalf("tar.WriteHeader(%+v): %v", hdr, err)
@@ -170,6 +175,35 @@ func TestUnpackLayer_HappyPath(t *testing.T) {
 	}
 	if !os.SameFile(srcInfo, dstInfo) {
 		t.Errorf("bin/bash is not a hardlink to bin/sh")
+	}
+}
+
+func TestUnpackLayer_RegularFileMtime(t *testing.T) {
+	for _, timestamp := range []time.Time{time.Unix(0, 0), time.Unix(1791219949, 0), time.Unix(1791219949, 123456789)} {
+		t.Run(timestamp.Format(time.RFC3339Nano), func(t *testing.T) {
+			entries := []tarEntry{
+				{name: "package/module.py", typeflag: tar.TypeReg, body: "old", modTime: timestamp.Add(time.Hour), format: tar.FormatPAX},
+				{name: "package/module.py", typeflag: tar.TypeReg, body: "value = 1\n", modTime: timestamp, format: tar.FormatPAX},
+				{name: "package/module-link.py", typeflag: tar.TypeLink, linkname: "package/module.py"},
+			}
+			dir, _, err := runUnpack(t, entries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"module.py", "module-link.py"} {
+				info, err := os.Stat(filepath.Join(dir, "package", name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !info.ModTime().Equal(timestamp) {
+					t.Errorf("%s mtime = %v, want %v", name, info.ModTime(), timestamp)
+				}
+				contents, err := os.ReadFile(filepath.Join(dir, "package", name))
+				if err != nil || string(contents) != "value = 1\n" {
+					t.Errorf("%s contents = %q, error = %v", name, contents, err)
+				}
+			}
+		})
 	}
 }
 

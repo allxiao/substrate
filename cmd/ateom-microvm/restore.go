@@ -163,7 +163,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	// that means before the share's virtiofsd starts, for Data before the workload
 	// cold-starts. The snapshot must carry them — the actor declares the volume, and
 	// every scope captures it.
-	if hasDurableVolumes(p.containers) {
+	if hasDurableVolumes(p.containers) && req.GetScope() == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
 		if err := untarDurableVolumes(durableDir, restoreDir); err != nil {
 			return nil, err
 		}
@@ -175,6 +175,9 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 			return nil, err
 		}
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
+		if hasDurableVolumes(p.containers) {
+			p.prepareDurable = func(context.Context) error { return untarDurableVolumes(durableDir, restoreDir) }
+		}
 		// A Data snapshot holds no guest state, so this is a cold boot that
 		// happens to start with the volumes already populated. wakeup probe gating comes
 		// with the cold-boot path, so the actor is serving when we return.

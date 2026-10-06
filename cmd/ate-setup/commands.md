@@ -42,6 +42,13 @@ a pre-scan pass, so they may appear anywhere on its command line.
 Both have an environment equivalent, read when the flag is absent:
 `ATE_IMAGE_REPO` and `ATE_IMAGE_TAG`.
 
+`ATE_INSTALL_AZURE_DEV=true` selects the opt-in development overlays for the
+resources in `resources.dev.md`. They wire explicit short-lived WI projections,
+remove GCP-only monitoring and credential mounts, and mirror the existing
+agentgateway dataplane into the supplied ACR. Use `--atenet-dataplane agentgateway`
+for this profile. It is environment-specific, not a general Azure provisioner;
+it does not change default GKE/Kind installations or create Azure infrastructure.
+
 ## Installing a release
 
 Without `--image-repo`, `ate-setup` builds every image from the checkout with

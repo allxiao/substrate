@@ -441,6 +441,9 @@ func writeTarFile(dest string, r io.Reader, mode fs.FileMode) error {
 // the returned reader. Streaming (rather than buffering the whole asset) keeps a
 // multi-hundred-MiB guest image off the heap.
 func (s *AteomHerder) openAsset(ctx context.Context, url string) (io.ReadCloser, error) {
+	if strings.HasPrefix(url, "azblob://") {
+		return objectstorage.Open(ctx, s.gcsClient, url)
+	}
 	rc, anonErr := objectstorage.Open(ctx, s.anonGCSClient, url)
 	if anonErr == nil {
 		return rc, nil

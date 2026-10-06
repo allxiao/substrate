@@ -977,6 +977,16 @@ message ActorTemplate {
 
   // +k8s:optional
   ActorTemplateStatus status = 8;
+
+  // cold_start selects HOME-only Data snapshots and cold process startup,
+  // without creating or restoring a golden memory snapshot.
+  // +k8s:optional
+  bool cold_start = 9;
+
+  // home_directory is the durable HOME mount for cold_start. Defaults to /root.
+  // +k8s:optional
+  // +k8s:maxLength=256
+  string home_directory = 10;
 }
 
 message Resources {
@@ -1029,6 +1039,29 @@ message GoldenSnapshotStatus {
 message ActorTemplateStatus {
   // +k8s:optional
   GoldenSnapshotStatus golden_snapshot_status = 1;
+
+  // +k8s:optional
+  ImagePreloadStatus image_preload_status = 2;
+}
+
+message ImagePreloadStatus {
+  // ready means all currently eligible worker nodes completed the image preload.
+  // +k8s:optional
+  bool ready = 1;
+
+  // +k8s:optional
+  // +k8s:maxItems=1000
+  // +k8s:listType=set
+  repeated string desired_nodes = 2;
+
+  // +k8s:optional
+  // +k8s:maxItems=1000
+  // +k8s:listType=set
+  repeated string cached_nodes = 3;
+
+  // +k8s:optional
+  // +k8s:maxLength=4096
+  string error_message = 4;
 }
 
 // SandboxConfig selects the sandbox runtime for an ActorTemplate.

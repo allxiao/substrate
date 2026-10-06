@@ -52,6 +52,10 @@ const cordonControlPlaneComponent = installDir + "/components/cordon-control-pla
 // steps.
 func SystemOverlay(cfg *config.Config) string {
 	switch {
+	case cfg.AzureDev && cfg.Router == config.RouterAgentgateway:
+		return installDir + "/azure-data-dev-agentgateway"
+	case cfg.AzureDev:
+		return installDir + "/azure-data-dev"
 	case cfg.Router == config.RouterAgentgateway && cfg.Kind:
 		return installDir + "/kind-agentgateway"
 	case cfg.Router == config.RouterAgentgateway:
@@ -141,6 +145,9 @@ func (e *Env) renderAtenetEgressManifest(ctx context.Context, provider config.Cr
 	if e.Cfg.Router == config.RouterAgentgateway {
 		if general {
 			return nil, fmt.Errorf("--experimental-additional-egress-extproc-service requires --atenet-dataplane=envoy")
+		}
+		if e.Cfg.AzureDev {
+			return e.renderResolve(ctx, e.Cfg.Path(installDir+"/azure-data-dev-egress"))
 		}
 		return e.renderResolve(ctx, e.Cfg.Path(installDir+"/agentgateway-egress"))
 	}

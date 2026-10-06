@@ -118,6 +118,22 @@ func newAteletConnCache(size int) *lru.Cache {
 // with per-atelet pod-UID-pinned credentials, caching the connection by the
 // atelet's pod UID. A pod that keeps its UID but gets a new IP, such as after a
 // node restart, is redialed.
+func (d *AteletDialer) NodeNames() []string {
+	nodes := map[string]bool{}
+	for _, object := range d.ateletIndexer.List() {
+		pod := object.(*corev1.Pod)
+		if pod.Spec.NodeName != "" && pod.DeletionTimestamp == nil {
+			nodes[pod.Spec.NodeName] = true
+		}
+	}
+	result := make([]string, 0, len(nodes))
+	for node := range nodes {
+		result = append(result, node)
+	}
+	slices.Sort(result)
+	return result
+}
+
 func (d *AteletDialer) DialForAteletOnNode(nodeName string) (*grpc.ClientConn, error) {
 	matchingAtelets, err := d.ateletIndexer.ByIndex(byNode, nodeName)
 	if err != nil {

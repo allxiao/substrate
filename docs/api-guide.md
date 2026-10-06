@@ -111,7 +111,7 @@ worker pod on a GPU node and reserves the device, and nothing else reads it.
 
 ## 2. ActorTemplate: The Workload Blueprint
 
-The `ActorTemplate` defines the code, environment, and state-management policies for a specific type of agent. It is used to generate the "Golden Snapshot" from which all actors of this type are derived.
+The `ActorTemplate` defines the code, environment, and state-management policies for a specific type of agent. By default it generates the "Golden Snapshot" used for initial activation. An opt-in cold-start microVM template instead starts from its OCI image and preserves only HOME through Data snapshots.
 
 ### Specification (`ActorTemplate`)
 
@@ -123,6 +123,14 @@ The `ActorTemplate` defines the code, environment, and state-management policies
 | `snapshotConfig` | `SnapshotConfig` | **Required.** The base object-storage location snapshots are written under, plus the pause/commit/resume scopes. See [Snapshot Storage Layout](#snapshot-storage-layout). |
 | `volumes` | `[]Volume` | Optional. Volumes the containers may mount, each a `durableDir`, an `externalVolumeTemplate` (see [CSI Volumes Guide](csi-volumes.md)), or a `systemInfo` volume (see [SystemInfo Volumes](#systeminfo-volumes)). Every declared volume must be mounted by at least one container. A `microvm` template may declare several `durableDir` volumes; a `gvisor` template is limited to one. |
 | `resources` | `*ResourceRequirements` | Optional. Declares each actor's compute size via `limits` — see [Sandbox Right-Sizing](#sandbox-right-sizing-resources). Immutable, like the rest of the template. |
+| `coldStart` | `bool` | Optional, false by default. Selects a single-container microVM HOME-only Data profile, bypasses golden creation, and preloads its digest-pinned image on every known atelet node. Both snapshot scopes default to Data; explicit Full and source tags are rejected in this profile. Other templates are unchanged. |
+| `homeDirectory` | `string` | Optional for cold-start templates, defaults to `/root`. A clean absolute path other than `/`; the platform creates the `home` durable volume/mount and injects matching `HOME`. The image or template cannot override system-managed `FOUNDRY_SESSION_ID`, which is the persisted Actor UUID and remains stable across cold resumes. |
+
+Cold-start template status reports `imagePreloadStatus.ready`, `desiredNodes`,
+`cachedNodes`, and `errorMessage`. Wait until the currently known atelet nodes
+are cached before measuring a warm activation. Reconciliation renews expiring
+cache pins and discovers new nodes; readiness is not a permanent guarantee and
+on-demand pulls remain the fallback. See the [HOME Data Agent](../demos/data-agent/README.md).
 
 The sandbox itself — the binaries (e.g. the gVisor `runsc` binary) and the `pauseImage` holding the sandbox's namespaces — comes from the cluster-scoped [`SandboxConfig`](#3-sandboxconfig-the-sandbox-itself) object the template names via `sandboxConfig.configName`. An actor always resolves the config from its current template — repointing the actor at another template requires the same config.
 

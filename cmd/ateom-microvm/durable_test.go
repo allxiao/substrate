@@ -55,6 +55,35 @@ func TestHasDurableVolumes(t *testing.T) {
 	}
 }
 
+func TestHomeDataSnapshotExcludesOtherState(t *testing.T) {
+	source := durableDirWith(t, []string{"home"}, false)
+	if err := os.WriteFile(filepath.Join(source, "home", "history.txt"), []byte("previous query\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "rootfs-only"), []byte("not durable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := t.TempDir()
+	if err := tarDurableVolumes(t.Context(), source, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	files, err := os.ReadDir(checkpoint)
+	if err != nil || len(files) != 1 || files[0].Name() != durableTarFile {
+		t.Fatalf("Data snapshot files = %v, %v", files, err)
+	}
+	restored := t.TempDir()
+	if err := untarDurableVolumes(restored, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(restored, "home", "history.txt")); err != nil || string(data) != "previous query\n" {
+		t.Fatalf("HOME content = %q, %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(restored, "rootfs-only")); !os.IsNotExist(err) {
+		t.Fatal("non-HOME data restored")
+	}
+}
+
 // durableDirWith returns a durable-dir volumes directory laid out the way atelet
 // prepares one: a subdirectory per volume, plus optionally a stray regular file.
 func durableDirWith(t *testing.T, volumes []string, strayFile bool) string {

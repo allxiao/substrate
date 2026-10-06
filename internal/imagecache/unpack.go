@@ -199,6 +199,9 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 			if closeErr != nil {
 				return nil, fmt.Errorf("while closing file %q: %w", name, closeErr)
 			}
+			if err := root.Chtimes(name, hdr.ModTime, hdr.ModTime); err != nil {
+				return nil, fmt.Errorf("while restoring mtime on file %q: %w", name, err)
+			}
 
 		case tar.TypeDir:
 			// Create owner-writable so children can be written even when the image

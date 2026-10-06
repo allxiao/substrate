@@ -33,6 +33,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateomstats"
 
 	"github.com/agent-substrate/substrate/internal/ateomnet"
+	"github.com/agent-substrate/substrate/internal/ateomtunnel"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
@@ -44,6 +45,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/sizing"
 	"github.com/agent-substrate/substrate/internal/wakeupprobe"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 )
 
@@ -311,7 +313,8 @@ type actorBootParams struct {
 	// the RunWorkload / RestoreWorkload RPC. It sizes the VM itself (vCPUs,
 	// memory); a container's own cgroup limit comes from its declared resources.
 	// Zero fields keep the kata defaults.
-	size sizing.SandboxSize
+	size           sizing.SandboxSize
+	prepareDurable func(context.Context) error
 }
 
 func (p actorBootParams) attribution() resources.ActorAttribution {
@@ -393,10 +396,9 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 		return fmt.Errorf("ateom-microvm requires %q and %q asset paths", assetKernel, assetImage)
 	}
 	rr := s.resolveRuntime(paths)
-	egress, err := s.tunnel.PrepareEgress(ctx, p.attribution(), p.egressGateway)
-	if err != nil {
-		return err
-	}
+	var egress *ateomtunnel.ActorEgress
+	var ctrs []actorContainer
+	var err error
 
 	// Networking (host side): the actor's own namespace. The tap is built below
 	// (after the VM exists) so its FDs are fresh. The caller unhosts on final
@@ -415,6 +417,21 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 			}
 		}
 	}()
+
+	if err := runColdPreparations(ctx,
+		func(ctx context.Context) error {
+			prepared, err := s.tunnel.PrepareEgress(ctx, p.attribution(), p.egressGateway)
+			egress = prepared
+			return err
+		},
+		func(context.Context) error {
+			prepared, err := s.buildActorContainers(p.actorDirs, containers)
+			ctrs = prepared
+			return err
+		}, p.prepareDurable,
+	); err != nil {
+		return err
+	}
 
 	// Guest sizing + agent kernel params.
 	memMiB, vcpus, kparams := s.guestConfig()
@@ -438,10 +455,6 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 
 	// Prepare each container's OCI spec + record its bundle rootfs (the overlay
 	// lower the host merges under the container's writable upper).
-	ctrs, err := s.buildActorContainers(p.actorDirs, containers)
-	if err != nil {
-		return err
-	}
 
 	// Reject limits the guest can never satisfy, before the containers reach the
 	// agent. Restore does not repeat this: it resumes a snapshotted VM, and the
@@ -801,6 +814,16 @@ func initParams(agentInit bool) string {
 // the earliest messages: hvc0 only exists once virtio-console probes, so the memory
 // map, CPU features and ACPI lines never reach the log. kataDebug adds the UART back
 // with earlycon (and pays the ~800ms) for diagnosing a guest that dies before then.
+func runColdPreparations(ctx context.Context, preparations ...func(context.Context) error) error {
+	group, ctx := errgroup.WithContext(ctx)
+	for _, prepare := range preparations {
+		if prepare != nil {
+			group.Go(func() error { return prepare(ctx) })
+		}
+	}
+	return group.Wait()
+}
+
 func buildVMConfig(id, kernel, image, kparams, consoleLog string, memMiB, vcpus int, agentInit, debug bool) ch.VmConfig {
 	cmdline := "root=/dev/vda1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4 " +
 		"panic=1 no_timer_check noreplace-smp console=hvc0 " +

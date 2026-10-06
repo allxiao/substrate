@@ -18,7 +18,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/agent-substrate/substrate/internal/nodepath"
 )
+
+func TestImageCacheDir(t *testing.T) {
+	want := filepath.Join(nodepath.BasePath, "image-cache-v2")
+	if ImageCacheDir != want {
+		t.Fatalf("image cache = %q, want fresh generation %q", ImageCacheDir, want)
+	}
+}
 
 func TestActorDirs(t *testing.T) {
 	const actorUID = "actor-uid-1"

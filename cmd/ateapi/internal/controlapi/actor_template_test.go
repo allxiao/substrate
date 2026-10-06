@@ -38,6 +38,58 @@ import (
 // validation; mutations tweak it per test case. The snapshot scopes and
 // resume policy are set explicitly because TestValidateActorTemplate
 // exercises validation directly, without defaulting.
+func TestColdTemplateHomeAndSession(t *testing.T) {
+	template := validActorTemplate(func(template *ateapipb.ActorTemplate) {
+		template.ColdStart = true
+		template.HomeDirectory = "/home/agent"
+		template.SandboxConfig.SandboxClass = ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM
+		template.SnapshotConfig.OnPause = ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED
+		template.SnapshotConfig.OnCommit = ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED
+		template.Containers[0].Env = []*ateapipb.EnvVar{{Name: "FOUNDRY_SESSION_ID", Value: "wrong"}, {Name: "HOME", Value: "/wrong"}}
+	})
+	if err := applyColdTemplateDefaults(template); err != nil {
+		t.Fatal(err)
+	}
+	if len(template.Volumes) != 1 || template.Containers[0].VolumeMounts[0].MountPath != "/home/agent" || template.SnapshotConfig.OnCommit != ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA {
+		t.Fatal("cold template was not normalized to HOME/Data")
+	}
+	actor := &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Uid: "380e382c-a087-48b0-a320-ab5800dc5197"}}
+	for attempt := 0; attempt < 2; attempt++ {
+		spec, err := workloadSpecFromActorTemplate(template, actor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(spec.Containers[0].Env) != 2 || spec.Containers[0].Env[1].Value != actor.Metadata.Uid {
+			t.Fatal("session changed or configured env shadowed system env")
+		}
+	}
+	template.SnapshotConfig.OnCommit = ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL
+	if err := applyColdTemplateDefaults(template); err == nil {
+		t.Fatal("Full snapshot accepted in cold mode")
+	}
+}
+
+func TestColdTemplateRejectsInvalidHomeAndContainer(t *testing.T) {
+	for _, home := range []string{"/", "relative", "/home/../root", "/home//agent", "/home/agent\n"} {
+		template := validActorTemplate(func(template *ateapipb.ActorTemplate) {
+			template.ColdStart = true
+			template.SandboxConfig.SandboxClass = ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM
+			template.HomeDirectory = home
+		})
+		if err := applyColdTemplateDefaults(template); err == nil {
+			t.Fatalf("invalid HOME accepted: %q", home)
+		}
+	}
+	template := validActorTemplate(func(template *ateapipb.ActorTemplate) {
+		template.ColdStart = true
+		template.SandboxConfig.SandboxClass = ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM
+		template.Containers = []*ateapipb.Container{nil}
+	})
+	if err := applyColdTemplateDefaults(template); err == nil {
+		t.Fatal("nil container accepted")
+	}
+}
+
 func validActorTemplate(mutations ...func(*ateapipb.ActorTemplate)) *ateapipb.ActorTemplate {
 	template := &ateapipb.ActorTemplate{
 		Metadata:   &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "tmpl-a"},

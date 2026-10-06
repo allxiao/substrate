@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/apiauthn"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/authz"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi"
@@ -37,6 +38,7 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workerservice"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
+	"github.com/agent-substrate/substrate/internal/azureauth"
 	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/installdefaults"
 	"github.com/agent-substrate/substrate/internal/localca"
@@ -443,6 +445,12 @@ func logFlagValues(ctx context.Context) {
 // it lives.
 func newObjectStore(ctx context.Context) (objectstore.Store, error) {
 	switch backend := os.Getenv("ATE_STORAGE_BACKEND"); backend {
+	case "azure":
+		client, credential, err := azureauth.NewBlobClient()
+		if err != nil {
+			return nil, err
+		}
+		return objectstore.NewAzure(client, credential), nil
 	case "s3":
 		slog.InfoContext(ctx, "Using S3 storage backend")
 		// Depends on the standard AWS environment variables, which have to be
@@ -457,12 +465,14 @@ func newObjectStore(ctx context.Context) (objectstore.Store, error) {
 			}
 		})), nil
 	// GCS is currently the default, TODO: we assume workload identity / ADC
-	default:
+	case "", "gcs":
 		client, err := storage.NewClient(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("creating GCS client: %w", err)
 		}
 		return objectstore.NewGCS(client), nil
+	default:
+		return nil, fmt.Errorf("unknown ATE_STORAGE_BACKEND %q", backend)
 	}
 }
 
@@ -512,6 +522,17 @@ var (
 )
 
 func connectPostgresWithRetries(ctx context.Context) (*atepg.Persistence, error) {
+	var tokenProvider func(context.Context) (string, error)
+	if clientID := os.Getenv("ATE_AZURE_POSTGRES_CLIENT_ID"); clientID != "" {
+		credential, err := azureauth.NewCredential(clientID)
+		if err != nil {
+			return nil, err
+		}
+		tokenProvider = func(ctx context.Context) (string, error) {
+			token, err := credential.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://ossrdbms-aad.database.windows.net/.default"}})
+			return token.Token, err
+		}
+	}
 	var connectErr error
 	for attempt := 1; attempt <= postgresConnectTries; attempt++ {
 		persistence, err := atepg.Connect(ctx, atepg.ConnectConfig{
@@ -521,6 +542,7 @@ func connectPostgresWithRetries(ctx context.Context) (*atepg.Persistence, error)
 			OwnerRole:     *postgresOwnerRole,
 			Schema:        *postgresSchema,
 			PoolMaxConns:  *postgresPoolMaxConns,
+			TokenProvider: tokenProvider,
 		})
 		if err == nil {
 			return persistence, nil

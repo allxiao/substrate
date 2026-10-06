@@ -90,7 +90,10 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) 
 
 	// Resolve the explicit tag, or freeze the template's current golden default.
 	tagRef := inActor.GetSourceTag()
-	if tagRef == nil {
+	if template.GetColdStart() && tagRef != nil {
+		return nil, status.Error(codes.InvalidArgument, "cold_start Actors cannot start from a source tag")
+	}
+	if tagRef == nil && !template.GetColdStart() {
 		tagRef = template.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag()
 	} else {
 		for _, volume := range template.GetVolumes() {

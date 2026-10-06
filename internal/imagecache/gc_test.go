@@ -17,6 +17,7 @@ package imagecache
 import (
 	"archive/tar"
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
@@ -60,6 +61,37 @@ func layerDirsOnDisk(t *testing.T, s *Store) []string {
 		}
 	}
 	return out
+}
+
+func TestPreloadPinSurvivesGCAndExpires(t *testing.T) {
+	_, host := newTestRegistry(t)
+	reference := host + "/test/pinned:latest"
+	pushImage(t, reference, v1.Config{}, layerFromEntries(t, []tarEntry{{name: "history-agent", typeflag: tar.TypeReg, mode: 0o644, body: "agent"}}))
+	store := newTestStore(t)
+	image, err := store.EnsureImagePinned(t.Context(), reference, "template-uid", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backdateStore(t, store, 3*time.Hour)
+	stats, err := store.EvictUnused(t.Context(), math.MaxInt64, false)
+	if err != nil || stats.EvictedImages != 0 {
+		t.Fatalf("pinned image evicted: %+v %v", stats, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(store.root, "pins"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinData, err := json.Marshal(imagePin{Digest: image.Digest.String(), ExpiresAt: time.Now().Add(-time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.root, "pins", entries[0].Name()), pinData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = store.EvictUnused(t.Context(), math.MaxInt64, false)
+	if err != nil || stats.EvictedImages == 0 {
+		t.Fatalf("expired pin prevented eviction: %+v %v", stats, err)
+	}
 }
 
 func TestEvictUnusedMinAgeVeto(t *testing.T) {

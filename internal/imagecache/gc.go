@@ -121,6 +121,9 @@ func (s *Store) InUse() (RootSet, error) {
 	// when suppressed.
 	dbg := slog.Default().Enabled(context.Background(), slog.LevelDebug)
 	rs := RootSet{ImageDigests: map[string]bool{}, LayerHexes: map[string]bool{}, LayerSets: map[string]bool{}}
+	if err := s.addPinRoots(&rs); err != nil {
+		return rs, fmt.Errorf("while reading image preload pins: %w", err)
+	}
 	if s.actorsDir == "" {
 		return rs, nil
 	}

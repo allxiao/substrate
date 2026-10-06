@@ -16,12 +16,49 @@ package atepg
 
 import (
 	"context"
+	"fmt"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"strings"
 	"testing"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
+
+func TestTokenProviderRefreshesAndCopies(t *testing.T) {
+	config, err := pgxpool.ParseConfig("host=localhost sslmode=verify-full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	applyTokenProvider(config, func(context.Context) (string, error) {
+		calls++
+		return fmt.Sprintf("token-%d", calls), nil
+	})
+	for index, candidate := range []*pgxpool.Config{config, config.Copy(), config.Copy()} {
+		if err := candidate.BeforeConnect(t.Context(), candidate.ConnConfig); err != nil {
+			t.Fatal(err)
+		}
+		if candidate.ConnConfig.Password != fmt.Sprintf("token-%d", index+1) {
+			t.Fatal("stale token")
+		}
+	}
+	applyTokenProvider(config, func(context.Context) (string, error) { return "", fmt.Errorf("denied") })
+	if err := config.BeforeConnect(t.Context(), config.ConnConfig); err == nil {
+		t.Fatal("token acquisition failure was ignored")
+	}
+	unsafeConfig, err := pgxpool.ParseConfig("host=localhost sslmode=require")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyTokenProvider(unsafeConfig, func(context.Context) (string, error) {
+		t.Fatal("token requested before TLS verification")
+		return "", nil
+	})
+	if err := unsafeConfig.BeforeConnect(t.Context(), unsafeConfig.ConnConfig); err == nil {
+		t.Fatal("unverified TLS accepted for token authentication")
+	}
+}
 
 // A listing fails as a whole on one undecodable row, so the error has to name
 // the row.

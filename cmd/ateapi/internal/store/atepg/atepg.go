@@ -123,6 +123,7 @@ type ConnectConfig struct {
 	OwnerRole     string
 	Schema        string
 	PoolMaxConns  int32
+	TokenProvider func(context.Context) (string, error)
 }
 
 // Connect opens read/write and owner pools. It creates the schema and applies migrations.
@@ -150,11 +151,13 @@ func Connect(ctx context.Context, config ConnectConfig) (*Persistence, error) {
 		readWriteConfig.MaxConns = config.PoolMaxConns
 	}
 	readWriteConfig.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{config.Schema}.Sanitize()
+	applyTokenProvider(readWriteConfig, config.TokenProvider)
 	ownerConfig, err := poolConfig(config.OwnerDSN, config.OwnerRole)
 	if err != nil {
 		return nil, fmt.Errorf("parse PostgreSQL owner connection string: %w", err)
 	}
 	ownerConfig.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{config.Schema}.Sanitize()
+	applyTokenProvider(ownerConfig, config.TokenProvider)
 	ownerConfig.MaxConns = ownerPoolMaxConns
 	ownerConfig.MinConns = 0
 	ownerConfig.MinIdleConns = 0
@@ -233,6 +236,32 @@ func createSchema(ctx context.Context, pool *pgxpool.Pool, schema string) error 
 
 // poolConfig parses a DSN, assumes the configured role, and refreshes TLS
 // material from projected certificate files for each new connection.
+func applyTokenProvider(config *pgxpool.Config, provider func(context.Context) (string, error)) {
+	if provider == nil {
+		return
+	}
+	previous := config.BeforeConnect
+	config.BeforeConnect = func(ctx context.Context, connection *pgx.ConnConfig) error {
+		if connection.TLSConfig == nil || connection.TLSConfig.InsecureSkipVerify {
+			return fmt.Errorf("token-authenticated PostgreSQL requires verified TLS")
+		}
+		if previous != nil {
+			if err := previous(ctx, connection); err != nil {
+				return err
+			}
+		}
+		token, err := provider(ctx)
+		if err != nil {
+			return fmt.Errorf("acquiring PostgreSQL token: %w", err)
+		}
+		if token == "" {
+			return fmt.Errorf("PostgreSQL token provider returned an empty token")
+		}
+		connection.Password = token
+		return nil
+	}
+}
+
 func poolConfig(dsn, role string) (*pgxpool.Config, error) {
 	if role == "" {
 		return nil, fmt.Errorf("PostgreSQL role must not be empty")

@@ -28,7 +28,7 @@ var (
 	// internal/imagecache). It lives under BasePath so the cached layer
 	// directories are visible at the same path in atelet (which writes them)
 	// and in every ateom pod (which mounts them as overlay lowerdirs).
-	ImageCacheDir = filepath.Join(nodepath.BasePath, "image-cache")
+	ImageCacheDir = filepath.Join(nodepath.BasePath, "image-cache-v2")
 )
 
 func RunSCBinaryPath(sha256 string) string {

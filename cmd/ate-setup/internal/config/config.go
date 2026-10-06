@@ -91,7 +91,8 @@ type Config struct {
 	Root string
 
 	// Kind selects the local Kind install profile (ATE_INSTALL_KIND).
-	Kind bool
+	Kind     bool
+	AzureDev bool
 
 	// Namespace is the namespace the control plane is installed into, from
 	// ATE_NAMESPACE. It defaults to the canonical installdefaults.SystemNamespace,
@@ -338,6 +339,7 @@ func Load(opts Options) (*Config, error) {
 	cfg := &Config{
 		Root:                              root,
 		Kind:                              kind,
+		AzureDev:                          env["ATE_INSTALL_AZURE_DEV"] == "true",
 		Namespace:                         firstNonEmpty(env["ATE_NAMESPACE"], installdefaults.SystemNamespace),
 		Kubeconfig:                        kubeconfig,
 		Context:                           firstNonEmpty(opts.Context, env["KUBECTL_CONTEXT"]),
