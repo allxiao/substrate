@@ -64,6 +64,9 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	if err := validateActorDirs(req.GetActorDirs()); err != nil {
 		return nil, err
 	}
+	if s.blockRootfs && req.GetScope() == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
+		return nil, apierror.FailedPrecondition("virtio-blk application rootfs supports Data snapshots only")
+	}
 	if !s.locks.Lock(ctx, req.GetActorUid()) {
 		return nil, fmt.Errorf("gave up waiting for the actor's lock: %w", ctx.Err())
 	}

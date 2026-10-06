@@ -37,6 +37,7 @@ import (
 const (
 	restoreDurationKey    = "ateom.actor.restore.duration"
 	checkpointDurationKey = "ateom.actor.checkpoint.duration"
+	storageDurationKey    = "ateom.actor.storage.duration"
 )
 
 // The phase names, suffixed onto the duration keys. Kept out of ateattr on
@@ -46,8 +47,8 @@ const (
 //
 // Checkpoint: snapshot, durable_dir and rootfs_upper run concurrently on the
 // paused guest, so the paused window costs their max, not their sum; prep,
-// pause and teardown are sequential around them. Restore: every phase is
-// sequential and the phases partition the total.
+// pause and teardown are sequential around them. Full restore phases partition
+// the total. Data restore's durable_dir can overlap other cold preparations.
 const (
 	phasePause       = "pause"
 	phaseSnapshot    = "snapshot"
@@ -64,6 +65,8 @@ const (
 	phaseVMRestore   = "vm_restore"
 	phaseResume      = "resume"
 	phaseWakeupProbe = "wakeup_probe"
+	phaseDurableBind = "durable_bind"
+	phaseVirtiofsd   = "virtiofsd"
 
 	phaseTotal = ateattr.SnapshotPhaseTotal
 )

@@ -187,6 +187,8 @@ type actorContainer struct {
 	name         string
 	bundle       string
 	bundleRootfs string
+	blockImage   string
+	blockDevice  string
 	// spec is the container's OCI spec shaped for micro-VM execution.
 	spec *specs.Spec
 	// imageMounts are the image volumes this container mounts, and where.
@@ -424,8 +426,8 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 			egress = prepared
 			return err
 		},
-		func(context.Context) error {
-			prepared, err := s.buildActorContainers(p.actorDirs, containers)
+		func(ctx context.Context) error {
+			prepared, err := s.buildActorContainers(ctx, p.actorDirs, containers)
 			ctrs = prepared
 			return err
 		}, p.prepareDurable,
@@ -490,7 +492,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 		return err
 	}
 	defer leaf.Close()
-	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, p.actorDirs, ctrs, containers, leaf.SysProcAttr())
+	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, p.attribution(), p.actorDirs, ctrs, containers, leaf.SysProcAttr())
 	if err != nil {
 		return err
 	}
@@ -527,6 +529,11 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	consoleLog := kata.ConsoleLogPath(actorUID)
 	vmCfg := buildVMConfig(actorUID, kernel, image, kparams, consoleLog, memMiB, vcpus,
 		agentInit(ctx, client.Info()), s.kataDebug)
+	for _, container := range ctrs {
+		if container.blockImage != "" {
+			vmCfg.Disks = append(vmCfg.Disks, ch.DiskConfig{Path: container.blockImage, Readonly: true, ImageType: "Raw", NumQueues: int32(vcpus), QueueSize: 1024})
+		}
+	}
 	if err := client.CreateVM(ctx, vmCfg); err != nil {
 		return fmt.Errorf("while creating VM: %w", err)
 	}
@@ -634,7 +641,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 // and records the bundle rootfs that backs the overlay's RO lower. No host disk is
 // mounted here — the merged overlays are assembled in stageMergedRootfs after the
 // sandbox state is clean. Both RunWorkload and RestoreWorkload go through here.
-func (s *AteomService) buildActorContainers(actorDirs *ateompb.ActorDirs, containers []*ateompb.Container) ([]actorContainer, error) {
+func (s *AteomService) buildActorContainers(ctx context.Context, actorDirs *ateompb.ActorDirs, containers []*ateompb.Container) ([]actorContainer, error) {
 	ctrs := make([]actorContainer, len(containers))
 	for i, c := range containers {
 		cn := c.GetName()
@@ -667,6 +674,14 @@ func (s *AteomService) buildActorContainers(actorDirs *ateompb.ActorDirs, contai
 			spec:         spec,
 			imageMounts:  c.GetImageVolumeMounts(),
 		}
+		if s.blockRootfs {
+			image, err := ensureBlockRootfs(ctx, s.blockCacheDir, bundle, s.blockMkfs, s.blockImageMiB)
+			if err != nil {
+				return nil, fmt.Errorf("preparing block rootfs for %q: %w", cn, err)
+			}
+			ctrs[i].blockImage = image
+			ctrs[i].blockDevice = fmt.Sprintf("/dev/vd%c", 'b'+i)
+		}
 	}
 	return ctrs, nil
 }
@@ -681,11 +696,24 @@ func (s *AteomService) buildActorContainers(actorDirs *ateompb.ActorDirs, contai
 // upper contents). The returned virtiofsd cmd outlives this call (CH
 // demand-pages from it); the caller owns it (tracked on runningActor, killed
 // in teardownActor).
-func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime, id string, actorDirs *ateompb.ActorDirs, ctrs []actorContainer, containers []*ateompb.Container, procAttr *syscall.SysProcAttr) (*exec.Cmd, error) {
+func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime, attribution resources.ActorAttribution, actorDirs *ateompb.ActorDirs, ctrs []actorContainer, containers []*ateompb.Container, procAttr *syscall.SysProcAttr) (_ *exec.Cmd, retErr error) {
+	id := attribution.UID
+	started := time.Now()
+	var dDurableBind, dVirtiofsd time.Duration
+	defer func() {
+		logSnapshotPhases(ctx, "Storage preparation timing breakdown", attribution,
+			ateompb.SnapshotScope_SNAPSHOT_SCOPE_UNSPECIFIED, storageDurationKey, retErr, []phase{
+				{phaseDurableBind, dDurableBind},
+				{phaseVirtiofsd, dVirtiofsd},
+				{phaseTotal, time.Since(started)},
+			})
+	}()
 	upperBase := rootfsUpperDir(actorDirs)
 	for _, c := range ctrs {
-		if err := kata.StageMergedRootfs(ctx, c.bundleRootfs, upperBase, id, c.name); err != nil {
-			return nil, fmt.Errorf("while staging merged rootfs for %q: %w", c.name, err)
+		if c.blockImage == "" {
+			if err := kata.StageMergedRootfs(ctx, c.bundleRootfs, upperBase, id, c.name); err != nil {
+				return nil, fmt.Errorf("while staging merged rootfs for %q: %w", c.name, err)
+			}
 		}
 		for _, vm := range c.imageMounts {
 			src := imagecache.ImageVolumeMountPath(c.bundle, vm.GetVolumeName())
@@ -695,7 +723,10 @@ func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime
 		}
 	}
 	if hasDurableVolumes(containers) {
-		if err := s.stageDurableVolumes(ctx, id, actorDirs.GetDurableDirVolumeMountsDir()); err != nil {
+		bindStarted := time.Now()
+		err := s.stageDurableVolumes(ctx, id, actorDirs.GetDurableDirVolumeMountsDir())
+		dDurableBind = time.Since(bindStarted)
+		if err != nil {
 			return nil, fmt.Errorf("while staging durable-dir volumes: %w", err)
 		}
 	}
@@ -710,6 +741,7 @@ func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime
 		}
 	}
 	vfsdLog, _ := os.OpenFile(virtiofsdLogPath(id), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	virtiofsdStarted := time.Now()
 	vfsdCmd, err := kata.StartVirtiofsd(ctx, kata.VirtiofsdOptions{
 		Binary:      rr.virtiofsd,
 		SocketPath:  kata.VirtiofsdSocketPath(id),
@@ -717,6 +749,7 @@ func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime
 		Log:         vfsdLog,
 		SysProcAttr: procAttr,
 	})
+	dVirtiofsd = time.Since(virtiofsdStarted)
 	if err != nil {
 		return nil, fmt.Errorf("while starting virtiofsd: %w", err)
 	}
@@ -909,6 +942,12 @@ func (s *AteomService) startActorContainers(ctx context.Context, ac *kata.AgentC
 	tNetwork := time.Now()
 
 	for _, c := range ctrs {
+		if c.blockImage != "" {
+			if err := ac.StartBlockRootfsContainer(ctx, c.name, c.spec, c.blockDevice, s.blockUpperMiB); err != nil {
+				return fmt.Errorf("starting block rootfs container %q: %w", c.name, err)
+			}
+			continue
+		}
 		if err := startRootfsContainer(ctx, ac, vsockPath, c); err != nil {
 			return err
 		}

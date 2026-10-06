@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -156,6 +157,105 @@ func TestSnapshotPhaseAttrsFailure(t *testing.T) {
 				t.Errorf("snapshot phase present with %v, want absent", v)
 			}
 		})
+	}
+}
+
+func TestRestoreDurablePhaseAttrs(t *testing.T) {
+	t.Parallel()
+	for _, scope := range []ateompb.SnapshotScope{
+		ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
+		ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA,
+	} {
+		t.Run(scope.String(), func(t *testing.T) {
+			t.Parallel()
+			record := renderPhaseRecord(t, snapshotPhaseAttrs(phaseLogAttribution(), scope,
+				restoreDurationKey, nil, []phase{
+					{phaseDurableDir, 12 * time.Millisecond},
+					{phaseTotal, 3 * time.Second},
+				}))
+			if got := record[restoreDurationKey+"."+phaseDurableDir]; got != 0.012 {
+				t.Errorf("durable_dir = %v, want 0.012 seconds", got)
+			}
+			if got := record[restoreDurationKey+"."+phaseTotal]; got != float64(3) {
+				t.Errorf("total = %v, want 3 seconds", got)
+			}
+			if got := record[string(ateattr.SnapshotScopeKey)]; got != scopeLogValue(scope) {
+				t.Errorf("scope = %v, want %s", got, scopeLogValue(scope))
+			}
+		})
+	}
+}
+
+func TestStoragePreparationPhaseAttrs(t *testing.T) {
+	t.Parallel()
+	for _, failure := range []bool{false, true} {
+		t.Run(fmt.Sprintf("failure=%t", failure), func(t *testing.T) {
+			t.Parallel()
+			var operationErr error
+			if failure {
+				operationErr = context.DeadlineExceeded
+			}
+			record := renderPhaseRecord(t, snapshotPhaseAttrs(phaseLogAttribution(),
+				ateompb.SnapshotScope_SNAPSHOT_SCOPE_UNSPECIFIED, storageDurationKey, operationErr, []phase{
+					{phaseDurableBind, 2 * time.Millisecond},
+					{phaseVirtiofsd, 5 * time.Millisecond},
+					{phaseTotal, 20 * time.Millisecond},
+				}))
+			for name, want := range map[string]float64{
+				phaseDurableBind: 0.002,
+				phaseVirtiofsd:   0.005,
+				phaseTotal:       0.020,
+			} {
+				if got := record[storageDurationKey+"."+name]; got != want {
+					t.Errorf("%s = %v, want %v seconds", name, got, want)
+				}
+			}
+			if got := record["ate.actor.uid"]; got != phaseLogAttribution().UID {
+				t.Errorf("actor UID = %v", got)
+			}
+			if failure && record["error.type"] != "DeadlineExceeded" {
+				t.Errorf("error.type = %v, want DeadlineExceeded", record["error.type"])
+			}
+			if !failure {
+				if _, exists := record["error.type"]; exists {
+					t.Error("successful storage preparation reports an error")
+				}
+			}
+		})
+	}
+}
+
+func TestStoragePreparationReportsFailedDurableBind(t *testing.T) {
+	var output bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	defer slog.SetDefault(previousLogger)
+
+	service := &AteomService{}
+	command, err := service.stageMergedRootfs(t.Context(), resolvedRuntime{}, phaseLogAttribution(),
+		&ateompb.ActorDirs{
+			OciBundleDir:              t.TempDir(),
+			DurableDirVolumeMountsDir: filepath.Join(t.TempDir(), "missing"),
+		}, nil, []*ateompb.Container{{
+			DurableDirVolumeMounts: []*ateompb.DurableDirVolumeMount{{VolumeName: "home"}},
+		}}, nil)
+	if err == nil || command != nil {
+		t.Fatalf("storage preparation = %v, %v, want failed bind", command, err)
+	}
+	var record map[string]any
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatalf("decode storage timing log: %v", err)
+	}
+	for _, name := range []string{phaseDurableBind, phaseTotal} {
+		if elapsed, ok := record[storageDurationKey+"."+name].(float64); !ok || elapsed <= 0 {
+			t.Errorf("%s = %v, want positive seconds", name, record[storageDurationKey+"."+name])
+		}
+	}
+	if _, exists := record[storageDurationKey+"."+phaseVirtiofsd]; exists {
+		t.Error("virtiofsd phase recorded before it ran")
+	}
+	if record["error.type"] != "Unknown" || record["ate.actor.uid"] != phaseLogAttribution().UID {
+		t.Errorf("failed storage preparation lost error or actor context: %v", record)
 	}
 }
 

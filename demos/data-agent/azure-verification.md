@@ -60,9 +60,10 @@ Actor traffic passes through an isolated host netns/TAP and guest virtio-net;
 atunnel supplies ingress/egress transport. These hops, DNS and certificate
 projection are omitted for readability. `podcertcontroller` and Entra Workload
 Identity preserve native mTLS and scoped Azure access. The Kata system disk
-uses virtio-blk; application files and HOME currently use virtio-fs. Cold Data
+uses virtio-blk; the default application files and HOME use virtio-fs. Cold Data
 Suspend persists HOME only, and Resume starts a new user process with the same
-Actor UUID. Prebooted VM pools and application block disks remain proposals.
+Actor UUID. Prebooted VM pools remain proposals. The opt-in application
+virtio-blk backend validated below is not shown in this default-path diagram.
 
 ## Native E2E Result (2026-10-06)
 
@@ -120,7 +121,7 @@ Five samples on a warm same-node cache, tiny HOME history, one vCPU Actor:
 | Phase | p50 | p95 (nearest rank, five samples) |
 | --- | --- | --- |
 | atelet Data checkpoint including remote persistence | 83.7 ms | 90.5 ms |
-| atelet cold Data restore through   | 5.627 s | 5.655 s |
+| atelet cold Data restore through readiness | 5.627 s | 5.655 s |
 
 The first observed cross-node restore took 5.460 s at atelet: Blob manifest
 5.93 ms, artifact download 6.18 ms, cached OCI preparation 0.79 ms, and runtime
@@ -134,6 +135,60 @@ CLI authentication/port-forward per invocation. Do not confuse these with
 runtime latency. Five observations are a smoke benchmark, not a production
 tail-latency SLO. Live local-cache corruption repair was not fault-injected;
 corruption and budget behavior remain covered by unit tests.
+
+### Session HOME Storage Timing Boundaries
+
+Session HOME is not a live Azure Blob mount. Suspend archives the node-local
+durable directory and persists the snapshot to Blob. Restore fetches the
+snapshot, extracts HOME onto the node, shares that directory through virtio-fs,
+and bind-mounts it into the guest container before the Agent entrypoint runs.
+The application-only entrypoint-to-listening tables below exclude these steps.
+
+The storage preparation fields below were added in the working tree; they need
+a newly built and deployed ateom-microvm before collecting native samples.
+Earlier measurements do not contain the newly separated values, so no new
+HOME extraction or mount percentiles can be inferred from them.
+
+| Suspend storage step | Log record and duration field | Measurement boundary |
+| --- | --- | --- |
+| Pause guest writes | ateom `Checkpoint timing breakdown`, `ateom.actor.checkpoint.duration.pause` | Pauses the guest before archiving the write-through HOME directory. |
+| Archive HOME | Same record, `ateom.actor.checkpoint.duration.durable_dir` | Writes `durable-dir.tar`; includes all declared durable-dir volumes, HOME only in this template. |
+| Persist to Azure Blob | atelet `Checkpoint timing breakdown`, `ate.actor.checkpoint.duration.persist` | External snapshot compression/upload and persistence work, including manifest handling; not a pure Blob network timer. |
+| Entire suspend snapshot operation | atelet record, `ate.actor.checkpoint.duration.total` | Encloses runtime checkpoint and persistence; it is not CLI wall time. |
+
+| Restore storage step | Log record and duration field | Measurement boundary |
+| --- | --- | --- |
+| Fetch manifest | atelet `Restore timing breakdown`, `ate.actor.restore.duration.manifest_fetch` | Remote Blob access or local cached manifest access. |
+| Prepare snapshot files | Same record, `ate.actor.restore.duration.download` | Artifact download/decompression or local cache materialization, before HOME tar extraction. |
+| Extract HOME on node | ateom `Restore timing breakdown`, `ateom.actor.restore.duration.durable_dir` | Extracts the durable tar into the Actor's host directory; separately recorded for Data and Full restore. |
+| Bind host HOME into shared tree | `Storage preparation timing breakdown`, `ateom.actor.storage.duration.durable_bind` | Host bind mount into the shared virtio-fs tree; not the guest container mount. |
+| Start shared file server | Same record, `ateom.actor.storage.duration.virtiofsd` | Starts the virtiofsd process/socket used by rootfs and volumes. |
+| Entire host shared-tree preparation | Same record, `ateom.actor.storage.duration.total` | Includes rootfs/other volume staging as well as durable bind and virtiofsd startup; not HOME-only. |
+| Mount guest virtio-fs share | `Agent setup phases`, `sandbox` | CreateSandbox RPC, including the base shared filesystem mount; not a pure mount timer. |
+| Bind HOME into container and start process | Same record, `containers` | CreateContainer mounts declared volumes, then StartContainer starts the process. HOME mount is contained here, not independently timed. |
+| Enclosing runtime restore | atelet record, `ate.actor.restore.duration.ateom_restore` | Includes HOME extraction, shared-tree setup, guest startup/mounts and readiness. |
+
+New per-phase ateom fields use float seconds, Actor attribution and failure
+markers like the existing snapshot timing records. A stage that never ran is
+omitted. Shared-tree preparation also runs on initial boot and has unknown
+snapshot scope; join it by Actor UID and the corresponding operation/trace,
+not by assuming it is always a Data restore.
+
+These rows are nested observations, not an additive list. Data HOME extraction
+can overlap cold preparation of bundles and egress credentials, and snapshot
+download overlaps runtime assets/OCI preparation in atelet. Full restore's
+`prep` now excludes its separately recorded `durable_dir`; shared-tree timing
+is still contained in Full restore's `lowers`. During Full checkpoint, HOME,
+rootfs-upper and VM-state capture can overlap. Do not add children to their
+parent totals or sum independent phase percentiles.
+
+For the previously observed cross-node sample, manifest access was 5.93 ms and
+artifact download was 6.18 ms; HOME extraction and mounting were included in
+the 5.447 s runtime restore but were not measured separately. Same-node cache
+hits avoid Blob reads, not HOME extraction and mount preparation. Future
+suspend/restore reports should retain the existing enclosing totals and add
+these storage rows from the same operation, separating cache-hit and remote
+download samples and reporting missing historical fields as unmeasured.
 
 ### Applied Mtime Fix And Cache Rebuild (2026-10-06)
 
@@ -206,6 +261,174 @@ session UUIDs, snapshot URIs and SUSPENDED states remain unchanged; their
 WorkerPool and application image were not modified. The unrelated denied
 upload Actor remains in its previously reported DELETING state. No Azure
 infrastructure resource or authorization grant was added.
+
+### Opt-In Virtio-blk Rootfs And First Reply A/B (2026-10-06)
+
+Application rootfs/dependencies now have an implemented opt-in virtio-blk
+backend. HOME and other supported volumes still use virtio-fs. The default
+worker remains virtio-fs; only independent test WorkerPools were deployed.
+This is not an overall volume migration, a Full snapshot implementation or
+runtime hotplug: application disks are included in vm.create before boot.
+
+The worker's `--rootfs-backend` accepts `virtio-fs` (default) or `virtio-blk`;
+`ATE_MICROVM_ROOTFS_BACKEND` supplies its image-level default. WorkerPool's
+workerImage selects the configured runtime. Block mode requires mkfs.ext4;
+[Dockerfile.block-rootfs](../../cmd/ateom-microvm/Dockerfile.block-rootfs)
+packages e2fsprogs explicitly. Relevant defaults are a 1,024-MiB immutable
+base, a 64-MiB private guest tmpfs upper and the shared node cache
+`/var/lib/ate/block-rootfs-cache-v1`. See the [operator instructions](README.md#optional-virtio-blk-application-rootfs).
+
+The cached base is built from the existing composed OCI bundle, including its
+mount targets and fixed guest DNS configuration. Its key includes the image
+digest, target directories, DNS and capacity. Writers take a cancellable
+per-key lock and publish only successful ext4 builds by atomic rename. Cache
+reuse verifies regular-file type, logical size and ext4 magic; it is not a
+cryptographic verification of every block. The opt-in cache does not yet have
+automatic budget eviction or an independent all-node build-prewarm API.
+Read-only bases may be shared by Actors; writable uppers are never shared.
+
+Kata mounts `/dev/vdb` read-only as ext4, a private tmpfs upper, and guest
+overlayfs for the container root. Additional containers use subsequent block
+devices. Kata's ephemeral create handler ignores ordinary mount size options,
+so an explicit UpdateEphemeralMounts remount applies the upper capacity
+before StartContainer. Full checkpoint/restore requests fail before changing
+Actor lifecycle state; existing virtio-fs Full workers are unchanged. Data
+captures only HOME and discards the guest upper on cold resume.
+
+#### Functional Verification And Cold Preparation
+
+A real native canary verified overlay rootfs under
+`/run/kata-containers/block-rootfs/agent`, with `/home/agent` still virtiofs.
+Its application root marker had to be absent on every startup; after Data
+Suspend/Resume that check passed, session UUID remained fixed, boot UUID
+changed, and exact Responses history retained the seed query. A separate
+probe verified upper capacity exactly 67,108,864 bytes and all 2,984 `.pyc`
+valid, without mtime repair. These canaries were excluded from performance
+samples. Rootfs `/tmp` is now guest-owned, so profiling uses native Actor log
+forwarding, not host reads of the previous rootfs-upper directory.
+
+The functional Actor was also restored from node 2 onto node 0, where the
+base was built locally. UID `1b5c77a9-e944-4d7b-890a-ab8796b6f4ac` remained
+stable, the rootfs marker was discarded, and the cross-node response included
+both prior HOME queries. This cold cross-node check is not a warm timing
+sample. No Full snapshot was claimed by any block-mode live test.
+
+The first cached base on node 2 was 1 GiB logical and about 204 MiB allocated.
+File birth-to-final-metadata timestamps spanned about 1.60 s
+(`15:23:43.577` to `15:23:45.176` UTC). This is a coarse file-construction
+interval, not a standalone measured mkfs CPU timer. It was primed before all
+timed block samples. A cold/missing-base activation incurs construction;
+the warm-cache numbers below must not be claimed for that case. Failed
+construction does not publish a reusable image. Base metadata/hardlinks/
+symlinks and warm-cache reuse were verified with real mkfs/debugfs tests.
+
+#### Matched Warm-Cache First-Reply Results
+
+Five alternating fresh-Actor pairs ran on node
+`aks-system-40703928-vmss000002`, one vCPU/512 MiB, worker one host CPU/1 GiB
+and 250m CPU request. Each Actor was suspended before the next backend ran.
+Both worker images were built from the same binary and identical e2fsprogs
+layer, differing only in backend configuration:
+
+```text
+virtio-fs worker:  menxiaosubstrate1005.azurecr.io/substrate/ateom-microvm@sha256:4cdabb6d1930340fd1b7a4f055745d06c0bc090b826837e16fbd417cae1576fc
+virtio-blk worker: menxiaosubstrate1005.azurecr.io/substrate/ateom-microvm@sha256:03771e4eba520acdc1ee11bfa193badd996f8b7e02b9c46b63ac9d54f0c2b4dc
+```
+
+Both used the identical previously measured Agent image
+`sha256:14c22963c817b104da877a73d213773a3e6dc273f6306597c8ce7d313b06cb71`
+and identical command:
+
+```sh
+export AGENT_ENTRYPOINT_START_NS=$(date +%s%N)
+exec python /app/app.py
+```
+
+OCI/runtime/base caches, worker Pods, templates, SDK construction and the
+authorized CONNECT port-forward were ready before sampling. Each CreateActor
+returned SUSPENDED; its first Responses request triggered the native cold
+activation. Replies were verified for exact new UUID/session, query and
+empty previous history. Guest stage records came through the same native
+stdout/stderr forwarding path on both backends. No pre-start scan, rootfs
+marker or dependency copy was performed in timed samples. Application
+entrypoint timers exclude VM boot; client first-reply timers include it.
+
+| Client interval, containment shown by `>` | virtio-fs p50 | virtio-blk p50 | Observed change |
+| --- | --- | --- | --- |
+| CreateActor CLI start to complete first reply | **7,850.595 ms** | **6,991.339 ms** | **10.9% shorter** |
+| > CreateActor CLI invocation | 3,547.220 ms | 3,581.918 ms | No rootfs-dependent improvement |
+| > First request submitted to complete response | **4,307.436 ms** | **3,361.318 ms** | **22.0% shorter** |
+
+| Five-pair tails, nearest-rank p95 | virtio-fs | virtio-blk |
+| --- | --- | --- |
+| CreateActor CLI | 6,307.375 ms | 3,704.960 ms |
+| First request to complete response | 4,399.932 ms | 3,409.645 ms |
+| CreateActor start to complete first reply | 10,707.307 ms | 7,114.605 ms |
+
+The first fs CLI creation was a 6.3 s outlier, retained rather than dropped;
+its tail difference is not a filesystem effect. Paired first-request savings
+were 1,040.050 / 910.186 / 833.090 / 977.799 / 898.014 ms. Five observations
+are smoke evidence, not a production SLO or a statistical tail guarantee.
+Client CLI includes authentication/port-forward/process overhead; server
+CreateActor medians were 4.873 ms versus 4.960 ms. Independent phase medians
+must not be added to reconstruct a sample.
+
+#### Preparation, Initialization And Response Breakdown
+
+| Native/application interval | virtio-fs p50 | virtio-blk p50 |
+| --- | --- | --- |
+| atelet Run, activation through readiness | **3,451.642 ms** | **2,570.187 ms** |
+| > Run excluding readiness, combined preparation envelope | 322.503 ms | 336.078 ms |
+| > > Residual outside post-BootVM timing, including post-run bookkeeping | 67.368 ms | 62.931 ms |
+| > > Guest boot to kata-agent connection | 217.936 ms | 235.179 ms |
+| > > Kata sandbox setup | 5.884 ms | 5.742 ms |
+| > > Guest network configuration | 3.691 ms | 3.888 ms |
+| > > Container create/mount/start | 26.199 ms | 24.722 ms |
+| > Readiness gate | **3,124.010 ms** | **2,254.147 ms** |
+| Application entrypoint to actual server listening (nested startup window) | **3,092.602 ms** | **2,237.303 ms** |
+| > Interpreter/application-loader boundary | 95.954 ms | 41.813 ms |
+| > Module entry to server listening | **2,992.083 ms** | **2,196.801 ms** |
+| > > Standard-library imports | 590.464 ms | 507.001 ms |
+| > > MAF core imports | 549.352 ms | 381.396 ms |
+| > > Responses/OpenAI imports | 1,267.624 ms | 836.035 ms |
+| > > FastAPI imports | 336.379 ms | 271.421 ms |
+| > > Uvicorn import | 156.099 ms | 106.785 ms |
+| > > MAF Agent construction | 5.377 ms | 5.130 ms |
+| > > Route registration | 59.462 ms | 31.003 ms |
+| > > Server/ASGI setup through lifespan | 44.743 ms | 20.961 ms |
+| > > Lifespan to listening | 0.497 ms | 0.516 ms |
+| First Responses handler through encoded response | **81.500 ms** | **82.092 ms** |
+| > Parsing/validation/response-ID | 0.507 ms | 0.577 ms |
+| > MAF/thread dispatch | 4.056 ms | 4.879 ms |
+| > HOME mkdir/open | 1.463 ms | 1.692 ms |
+| > flock / history read / append+flush | 0.136 / 0.091 / 0.343 ms | 0.325 / 0.073 / 0.537 ms |
+| > HOME fsync | 6.542 ms | 6.509 ms |
+| > Answer/MAF return | 1.655 ms | 1.700 ms |
+| > Responses conversion/encoding | 64.044 ms | 66.220 ms |
+
+Run/readiness and entrypoint/module rows are overlapping timer views, not
+additional sequential stages. Socket wait and small definition/object-entry
+steps are omitted here; raw samples retain them. The preparation envelope
+was not faster overall (about 13.6 ms higher in its median), while application
+entrypoint startup improved 27.7% and total atelet Run improved 25.5%.
+The first-request improvement is therefore concentrated in initialization,
+not session creation or HOME writes. This changes both the application
+read path and writable-upper placement; it is not an isolated protocol-only
+experiment. Both environments still include guest execution, KVM and shared
+host CPU costs, and remain slower than the earlier ordinary-Pod control.
+
+Generated evidence is retained transiently at `/tmp/substrate-rootfs-ab.json`,
+`/tmp/substrate-rootfs-ab-events.json` and
+`/tmp/substrate-rootfs-ab-summary.json`. Full microVM race/vet/lint passed,
+including existing virtio-fs/Full behavior, cache metadata preservation,
+key/config changes, confinement, canceled lock waits and unsupported-Full
+rejection. Native canaries proved 64-MiB enforcement, bytecode validity,
+stable session/fresh boot, durable history and disposable rootfs state.
+Temporary A/B Actors/templates/pools and CONNECT forwarding were cleaned;
+original sessions/snapshots, normal WorkerPool and atelet deployment remain
+unchanged. The cached base and published opt-in images are retained. No
+Azure infrastructure resource or authorization grant was added. Full repository
+verification retains the pre-existing unrelated/dirty-tree limitations below.
 
 ### Same-Image Entrypoint To Listening A/B (2026-10-06)
 
@@ -753,8 +976,10 @@ The evidence and mechanisms are:
 
 #### Potential Virtio-blk Improvement
 
-**Virtio-blk is a plausible optimization for immutable Python runtime and
-dependency reads, not yet a measured improvement in this application.** The
+This section records the original proposal; the implemented opt-in backend
+and measured results are now in [the rootfs A/B above](#opt-in-virtio-blk-rootfs-and-first-reply-ab-2026-10-06).
+At proposal time, virtio-blk was an unmeasured candidate for immutable Python
+runtime/dependency reads. The
 [current VM configuration](../../cmd/ateom-microvm/run.go#L826) already boots
 the Kata system image through read-only virtio-blk `/dev/vda`. The application
 rootfs and Python dependencies still use virtio-fs, so changing only that
@@ -797,9 +1022,9 @@ The smallest proposed controlled experiment is:
 Moving HOME itself to a block filesystem is a separate architecture change:
 it introduces guest-filesystem flush/quiescence, host visibility and snapshot
 consistency/format questions. It is not required for the immutable-dependency
-A/B and is not proposed as part of that experiment. No application block
-disk, hotplug implementation, storage migration or runtime rollout has been
-performed; the deployed path remains virtio-fs with the mtime fix. Globally
+A/B and is not proposed as part of that experiment. The later implementation
+adds pre-boot application block disks to opt-in Data-only workers, not block
+hotplug or HOME migration; the normal deployment remains virtio-fs. Globally
 switching the unified share to `cache=always` likewise remains unsafe without
 a consistency contract for HOME and host-updated files.
 

@@ -103,6 +103,9 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	if err := validateActorDirs(req.GetActorDirs()); err != nil {
 		return nil, err
 	}
+	if s.blockRootfs && req.GetScope() == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
+		return nil, apierror.FailedPrecondition("virtio-blk application rootfs supports Data restores only")
+	}
 	if !s.locks.Lock(ctx, req.GetActorUid()) {
 		return nil, fmt.Errorf("gave up waiting for the actor's lock: %w", ctx.Err())
 	}
@@ -135,8 +138,15 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	restoreDir := p.actorDirs.GetRestoreDir()
 	durableDir := p.actorDirs.GetDurableDirVolumeMountsDir()
 	tStart := time.Now()
+	var dDurable time.Duration
 
 	attribution := p.actorAttribution()
+	defer func() {
+		if retErr != nil && dDurable != 0 {
+			logSnapshotPhases(ctx, "Restore storage timing breakdown", attribution, req.GetScope(),
+				restoreDurationKey, retErr, []phase{{phaseDurableDir, dDurable}})
+		}
+	}()
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor restoring", attribution)
 
 	// A VM still running for this actor would be dropped from tracking by the
@@ -164,19 +174,27 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	// cold-starts. The snapshot must carry them — the actor declares the volume, and
 	// every scope captures it.
 	if hasDurableVolumes(p.containers) && req.GetScope() == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
-		if err := untarDurableVolumes(durableDir, restoreDir); err != nil {
+		started := time.Now()
+		err := untarDurableVolumes(durableDir, restoreDir)
+		dDurable = time.Since(started)
+		if err != nil {
 			return nil, err
 		}
 	}
 
 	switch scope := req.GetScope(); scope {
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
-		if err := s.restoreFullScope(ctx, p, scope, restoreDir, req.GetPreserveRestoreDir(), tStart); err != nil {
+		if err := s.restoreFullScope(ctx, p, scope, restoreDir, req.GetPreserveRestoreDir(), tStart, dDurable); err != nil {
 			return nil, err
 		}
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
 		if hasDurableVolumes(p.containers) {
-			p.prepareDurable = func(context.Context) error { return untarDurableVolumes(durableDir, restoreDir) }
+			p.prepareDurable = func(context.Context) error {
+				started := time.Now()
+				err := untarDurableVolumes(durableDir, restoreDir)
+				dDurable += time.Since(started)
+				return err
+			}
 		}
 		// A Data snapshot holds no guest state, so this is a cold boot that
 		// happens to start with the volumes already populated. wakeup probe gating comes
@@ -187,10 +205,8 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		dTotal := time.Since(tStart)
 		slog.InfoContext(ctx, "Actor restored (durable-dir volumes, cold boot)",
 			slog.String("id", p.actorUID), slog.Duration("total", dTotal))
-		// A cold boot has none of the full-scope phases, so the total is the
-		// only observation on its record.
 		logSnapshotPhases(ctx, "Restore timing breakdown", attribution, scope,
-			restoreDurationKey, nil, []phase{{phaseTotal, dTotal}})
+			restoreDurationKey, nil, []phase{{phaseDurableDir, dDurable}, {phaseTotal, dTotal}})
 	default:
 		return nil, apierror.InvalidArgument("unsupported snapshot scope: %v", scope)
 	}
@@ -211,7 +227,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 // and resume. Guest RAM — the actor's in-memory state and the frozen network config —
 // comes back from the memory snapshot; the durable-dir volumes were restored by the
 // caller from their tar.
-func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, scope ateompb.SnapshotScope, restoreDir string, preserveRestoreDir bool, tStart time.Time) (retErr error) {
+func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, scope ateompb.SnapshotScope, restoreDir string, preserveRestoreDir bool, tStart time.Time, dDurable time.Duration) (retErr error) {
 	actorUID := p.actorUID
 
 	rr := s.resolveRuntime(p.assetPaths)
@@ -273,7 +289,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	if len(containers) > maxActorContainers {
 		return apierror.Unimplemented("ateom-microvm supports at most %d containers, got %d", maxActorContainers, len(containers))
 	}
-	ctrs, err := s.buildActorContainers(p.actorDirs, containers)
+	ctrs, err := s.buildActorContainers(ctx, p.actorDirs, containers)
 	if err != nil {
 		return err
 	}
@@ -292,7 +308,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		return err
 	}
 	defer leaf.Close()
-	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, p.actorDirs, ctrs, containers, leaf.SysProcAttr())
+	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, p.attribution(), p.actorDirs, ctrs, containers, leaf.SysProcAttr())
 	if err != nil {
 		return err
 	}
@@ -304,7 +320,6 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	}()
 
 	tLowers := time.Now()
-	tDurable := tLowers
 
 	// Networking: rebuild the actor's namespace; the snapshot's virtio-net is
 	// fd-backed, so CH needs fresh tap FDs (net_fds) on restore. The caller
@@ -434,27 +449,25 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	dWakeupProbe := time.Since(tResume)
 	dTotal := time.Since(tStart)
 	slog.InfoContext(ctx, "Actor restore phases", slog.String("id", actorUID),
-		slog.Duration("prep", tPrep.Sub(tStart)),
+		slog.Duration("prep", tPrep.Sub(tStart)-dDurable),
+		slog.Duration("durable_dir", dDurable),
 		slog.Duration("bundles", tBundles.Sub(tPrep)),
 		slog.Duration("upper_join", tUpper.Sub(tBundles)),
 		slog.Duration("lowers", tLowers.Sub(tUpper)),
-		slog.Duration("durable", tDurable.Sub(tLowers)),
-		slog.Duration("tap", tTap.Sub(tDurable)),
+		slog.Duration("tap", tTap.Sub(tLowers)),
 		slog.Duration("vmm_launch", tLaunch.Sub(tTap)),
 		slog.Duration("vm_restore", tVMRestore.Sub(tLaunch)),
 		slog.Duration("resume", tResume.Sub(tVMRestore)),
 		slog.Duration("wakeup_probe", dWakeupProbe),
 		slog.Duration("total", dTotal))
-	// The joinable per-actor record the benchmarking tooling aggregates. The
-	// durable delta is not carried: tDurable is pinned to tLowers today, so it
-	// would always be the zero a record skips.
 	logSnapshotPhases(ctx, "Restore timing breakdown", p.actorAttribution(), scope,
 		restoreDurationKey, nil, []phase{
-			{phasePrep, tPrep.Sub(tStart)},
+			{phasePrep, tPrep.Sub(tStart) - dDurable},
+			{phaseDurableDir, dDurable},
 			{phaseBundles, tBundles.Sub(tPrep)},
 			{phaseUpperJoin, tUpper.Sub(tBundles)},
 			{phaseLowers, tLowers.Sub(tUpper)},
-			{phaseTap, tTap.Sub(tDurable)},
+			{phaseTap, tTap.Sub(tLowers)},
 			{phaseVMMLaunch, tLaunch.Sub(tTap)},
 			{phaseVMRestore, tVMRestore.Sub(tLaunch)},
 			{phaseResume, tResume.Sub(tVMRestore)},

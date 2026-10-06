@@ -28,7 +28,9 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,12 +61,17 @@ import (
 )
 
 var (
-	podUID        = pflag.String("pod-uid", "", "The UID of the current pod")
-	chBinary      = pflag.String("cloud-hypervisor-binary", "cloud-hypervisor", "Path to the cloud-hypervisor binary (used to relaunch on restore).")
-	kataDebug     = pflag.Bool("kata-debug", false, "Verbose kata-agent debugging: raise the guest agent log level and forward the guest console (incl. agent logs) into the pod logs.")
-	vmmMemReserve = pflag.Int("vmm-mem-reserve-mib", vmmMemReserveMiB, "Guest RAM (MiB) held back from the pod's memory limit for the cloud-hypervisor VMM + virtiofsd, which run as host processes in the pod cgroup alongside the guest RAM. Prevents the pod OOMing when the VM is sized to the pod's memory limit.")
-	showVersion   = pflag.Bool("version", false, "Print version and exit.")
-	logLevelFlag  = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
+	podUID              = pflag.String("pod-uid", "", "The UID of the current pod")
+	chBinary            = pflag.String("cloud-hypervisor-binary", "cloud-hypervisor", "Path to the cloud-hypervisor binary (used to relaunch on restore).")
+	kataDebug           = pflag.Bool("kata-debug", false, "Verbose kata-agent debugging: raise the guest agent log level and forward the guest console (incl. agent logs) into the pod logs.")
+	vmmMemReserve       = pflag.Int("vmm-mem-reserve-mib", vmmMemReserveMiB, "Guest RAM (MiB) held back from the pod's memory limit for the cloud-hypervisor VMM + virtiofsd, which run as host processes in the pod cgroup alongside the guest RAM. Prevents the pod OOMing when the VM is sized to the pod's memory limit.")
+	showVersion         = pflag.Bool("version", false, "Print version and exit.")
+	logLevelFlag        = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
+	rootfsBackend       = pflag.String("rootfs-backend", defaultRootfsBackend(), "Application rootfs backend: virtio-fs or virtio-blk. Block rootfs supports Data snapshots only; HOME remains virtio-fs.")
+	blockRootfsCache    = pflag.String("block-rootfs-cache-dir", filepath.Join(nodepath.BasePath, "block-rootfs-cache-v1"), "Node-shared cache directory for immutable application ext4 images.")
+	blockRootfsImageMiB = pflag.Int("block-rootfs-image-mib", 1024, "Capacity of each cached application ext4 image in MiB.")
+	blockRootfsUpperMiB = pflag.Int("block-rootfs-upper-mib", 64, "Maximum guest tmpfs writable application upper size in MiB.")
+	blockRootfsMkfs     = pflag.String("block-rootfs-mkfs", "mkfs.ext4", "Filesystem builder required when virtio-blk rootfs is selected.")
 
 	otlpRelaySocket = pflag.String("otlp-relay-socket", nodepath.AteletOTLPSocketPath(),
 		"Unix socket of atelet's OTLP relay to export telemetry through, keeping it off the pod network. Empty, or absent at startup, exports directly to OTEL_EXPORTER_OTLP_ENDPOINT instead.")
@@ -90,6 +97,17 @@ func main() {
 }
 
 func do(ctx context.Context) error {
+	if *rootfsBackend != "virtio-fs" && *rootfsBackend != "virtio-blk" {
+		return fmt.Errorf("unsupported rootfs backend %q", *rootfsBackend)
+	}
+	if *rootfsBackend == "virtio-blk" {
+		if *blockRootfsImageMiB < 32 || *blockRootfsImageMiB > 32768 || *blockRootfsUpperMiB <= 0 || !filepath.IsAbs(*blockRootfsCache) {
+			return fmt.Errorf("invalid block rootfs cache path or capacity")
+		}
+		if _, err := exec.LookPath(*blockRootfsMkfs); err != nil {
+			return fmt.Errorf("virtio-blk rootfs requires mkfs: %w", err)
+		}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -222,6 +240,11 @@ func do(ctx context.Context) error {
 	}
 	ateomService := NewService(*podUID, *chBinary, *kataDebug, *vmmMemReserve, *maxActors, tunnel, actorLogger)
 	ateomService.actorCgroups = actorCgroups
+	ateomService.blockRootfs = *rootfsBackend == "virtio-blk"
+	ateomService.blockCacheDir = *blockRootfsCache
+	ateomService.blockImageMiB = *blockRootfsImageMiB
+	ateomService.blockUpperMiB = *blockRootfsUpperMiB
+	ateomService.blockMkfs = *blockRootfsMkfs
 
 	svr := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
@@ -353,7 +376,12 @@ type AteomService struct {
 	maxActors int
 	// actorCgroups is set when the worker's cgroup is delegated, so each actor's
 	// VMM and virtiofsd run in a leaf of their own.
-	actorCgroups bool
+	actorCgroups  bool
+	blockRootfs   bool
+	blockCacheDir string
+	blockImageMiB int
+	blockUpperMiB int
+	blockMkfs     string
 }
 
 var _ ateompb.AteomServer = (*AteomService)(nil)

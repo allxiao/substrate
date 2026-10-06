@@ -44,6 +44,47 @@ uploads complete. Resume reconstructs HOME and cold-starts the process with the
 same session ID. A node-local cache can serve the same immutable Data snapshot
 without Blob reads; a first cross-node restore still needs the Blob download.
 
+## Optional virtio-blk Application Rootfs
+
+The microVM worker can select `--rootfs-backend=virtio-blk` (or the worker
+image's `ATE_MICROVM_ROOTFS_BACKEND=virtio-blk`). The default remains
+`virtio-fs`. This affects application rootfs/immutable dependencies only;
+HOME and other supported volumes retain their virtio-fs bindings and Data
+snapshot contract. Use a dedicated WorkerPool and this demo's Cold/Data
+template. Full checkpoint/restore is explicitly rejected by a block worker.
+
+Block mode caches a read-only ext4 base on the shared node volume at
+`/var/lib/ate/block-rootfs-cache-v1`. First use materializes the composed OCI
+rootfs with mkfs.ext4; subsequent matching image/configuration requests reuse
+it. The default image capacity is 1,024 MiB (`--block-rootfs-image-mib`).
+Provision disk headroom for cold construction and retained bases. The current
+opt-in cache has no automatic capacity eviction; do not delete images used
+by live VMs. Existing node OCI prewarm does not itself build these bases.
+
+Each guest mounts the base read-only and creates an isolated tmpfs overlay
+upper, limited to 64 MiB by default (`--block-rootfs-upper-mib`). That limit
+is enforced before the application process starts; writes outside HOME are
+discarded on Data resume. Applications with large rootfs writes must use
+appropriate durable mounts or an explicitly sized upper. This is not a
+replacement for the original Full/golden rootfs path.
+
+Package the required filesystem builder explicitly, for example:
+
+```bash
+KO_DOCKER_REPO=ko.local hack/run-tool.sh ko build --base-import-paths \
+  --platform=linux/amd64 --tags=blk-runtime ./cmd/ateom-microvm
+docker build --build-arg RUNTIME_IMAGE=ko.local/ateom-microvm:blk-runtime \
+  --build-arg ROOTFS_BACKEND=virtio-blk \
+  -f cmd/ateom-microvm/Dockerfile.block-rootfs \
+  -t "$MICROVM_WORKER_IMAGE" cmd/ateom-microvm
+docker push "$MICROVM_WORKER_IMAGE"
+```
+
+Pin the resulting worker image digest in WorkerPool. The same Dockerfile with
+`ROOTFS_BACKEND=virtio-fs` produces an equal-code/tooling comparison worker.
+See [the rootfs A/B results](azure-verification.md#opt-in-virtio-blk-rootfs-and-first-reply-ab-2026-10-06)
+for measured warm-cache gains, cold-build costs and limitations.
+
 ## Azure development validation
 
 Use the existing resources and security constraints in `resources.dev.md`.
