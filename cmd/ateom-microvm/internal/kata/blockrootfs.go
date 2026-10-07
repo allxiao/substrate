@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/third_party/kata/agentpb"
@@ -29,7 +30,9 @@ func BlockRootfsStorages(containerID, device string, upperMiB int) ([]*agentpb.S
 	if containerID == "" || path.Base(containerID) != containerID || containerID == "." || containerID == ".." || strings.ContainsAny(containerID, ":,\x00") {
 		return nil, "", fmt.Errorf("invalid block rootfs container ID %q", containerID)
 	}
-	if !strings.HasPrefix(device, "/dev/vd") || len(device) != len("/dev/vdb") || device[len(device)-1] < 'b' || device[len(device)-1] > 'z' {
+	index, indexErr := strconv.Atoi(strings.TrimPrefix(device, "/dev/pmem"))
+	pmem := indexErr == nil && index >= 0 && index < 25 && device == fmt.Sprintf("/dev/pmem%d", index)
+	if !pmem && (!strings.HasPrefix(device, "/dev/vd") || len(device) != len("/dev/vdb") || device[len(device)-1] < 'b' || device[len(device)-1] > 'z') {
 		return nil, "", fmt.Errorf("invalid application block device %q", device)
 	}
 	if upperMiB <= 0 {
@@ -46,6 +49,9 @@ func BlockRootfsStorages(containerID, device string, upperMiB int) ([]*agentpb.S
 		}, Options: []string{
 			"lowerdir=" + lower, "upperdir=" + path.Join(writable, "upper"), "workdir=" + path.Join(writable, "work"), "index=off",
 		}},
+	}
+	if pmem {
+		storages[0].Options = append(storages[0].Options, "dax=always")
 	}
 	return storages, rootfs, nil
 }

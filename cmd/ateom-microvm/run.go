@@ -529,8 +529,24 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	consoleLog := kata.ConsoleLogPath(actorUID)
 	vmCfg := buildVMConfig(actorUID, kernel, image, kparams, consoleLog, memMiB, vcpus,
 		agentInit(ctx, client.Info()), s.kataDebug)
+	if s.memoryTHP {
+		memory, err := prepareTHPMemory(filepath.Join(kata.VMDir(actorUID), "memory"), memMiB)
+		if err != nil {
+			return fmt.Errorf("preparing guest memory THP: %w", err)
+		}
+		vmCfg.Memory = memory
+		defer func() {
+			if retErr != nil {
+				_ = unix.Unmount(filepath.Join(kata.VMDir(actorUID), "memory"), unix.MNT_DETACH)
+			}
+		}()
+	}
 	for _, container := range ctrs {
 		if container.blockImage != "" {
+			if s.blockAccess == "virtio-pmem" {
+				vmCfg.Pmem = append(vmCfg.Pmem, ch.PmemConfig{File: container.blockImage, Size: int64(s.blockImageMiB) * 1024 * 1024, DiscardWrites: true})
+				continue
+			}
 			vmCfg.Disks = append(vmCfg.Disks, ch.DiskConfig{Path: container.blockImage, Readonly: true, ImageType: "Raw", NumQueues: int32(vcpus), QueueSize: 1024})
 		}
 	}
@@ -681,9 +697,43 @@ func (s *AteomService) buildActorContainers(ctx context.Context, actorDirs *ateo
 			}
 			ctrs[i].blockImage = image
 			ctrs[i].blockDevice = fmt.Sprintf("/dev/vd%c", 'b'+i)
+			if s.blockAccess == "virtio-pmem" {
+				ctrs[i].blockDevice = fmt.Sprintf("/dev/pmem%d", i)
+			}
 		}
 	}
 	return ctrs, nil
+}
+
+func thpMemoryConfig(path string, memMiB int) ch.MemoryConfig {
+	return ch.MemoryConfig{Zones: []ch.MemoryZoneConfig{{ID: "ram", Size: int64(memMiB) * 1024 * 1024, File: path, Shared: true}}}
+}
+
+func prepareTHPMemory(dir string, memMiB int) (_ ch.MemoryConfig, retErr error) {
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return ch.MemoryConfig{}, err
+	}
+	if err := unix.Mount("tmpfs", dir, "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, fmt.Sprintf("size=%dm,huge=within_size,mode=0700", memMiB)); err != nil {
+		return ch.MemoryConfig{}, err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = unix.Unmount(dir, unix.MNT_DETACH)
+		}
+	}()
+	path := filepath.Join(dir, "ram")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return ch.MemoryConfig{}, err
+	}
+	if err := file.Truncate(int64(memMiB) * 1024 * 1024); err != nil {
+		_ = file.Close()
+		return ch.MemoryConfig{}, err
+	}
+	if err := file.Close(); err != nil {
+		return ch.MemoryConfig{}, err
+	}
+	return thpMemoryConfig(path, memMiB), nil
 }
 
 // stageMergedRootfs assembles each container's merged rootfs on the host

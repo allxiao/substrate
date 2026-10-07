@@ -27,6 +27,7 @@ type VmConfig struct {
 	Memory   MemoryConfig    `json:"memory"`
 	Payload  PayloadConfig   `json:"payload"`
 	Disks    []DiskConfig    `json:"disks,omitempty"`
+	Pmem     []PmemConfig    `json:"pmem,omitempty"`
 	Fs       []FsConfig      `json:"fs,omitempty"`
 	Rng      *RngConfig      `json:"rng,omitempty"`
 	Serial   *ConsoleConfig  `json:"serial,omitempty"`
@@ -61,8 +62,16 @@ type CpusConfig struct {
 // is what lets vm.snapshot write a SPARSE image (the memory-only snapshot the
 // rest of ateom relies on).
 type MemoryConfig struct {
-	Size   int64 `json:"size"`
-	Shared bool  `json:"shared"`
+	Size   int64              `json:"size"`
+	Shared bool               `json:"shared"`
+	Zones  []MemoryZoneConfig `json:"zones,omitempty"`
+}
+
+type MemoryZoneConfig struct {
+	ID     string `json:"id"`
+	Size   int64  `json:"size"`
+	File   string `json:"file"`
+	Shared bool   `json:"shared"`
 }
 
 // PayloadConfig points at the guest kernel + its cmdline (initramfs/firmware
@@ -82,6 +91,12 @@ type DiskConfig struct {
 	NumQueues int32  `json:"num_queues,omitempty"`
 	QueueSize int32  `json:"queue_size,omitempty"`
 	ImageType string `json:"image_type,omitempty"`
+}
+
+type PmemConfig struct {
+	File          string `json:"file"`
+	Size          int64  `json:"size"`
+	DiscardWrites bool   `json:"discard_writes"`
 }
 
 // RngConfig sets the entropy source (kata uses /dev/urandom).

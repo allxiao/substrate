@@ -85,6 +85,26 @@ Pin the resulting worker image digest in WorkerPool. The same Dockerfile with
 See [the rootfs A/B results](azure-verification.md#opt-in-virtio-blk-rootfs-and-first-reply-ab-2026-10-06)
 for measured warm-cache gains, cold-build costs and limitations.
 
+The same Data-only block worker can additionally select
+`--block-rootfs-access=virtio-pmem` and `--guest-memory-thp`. These are opt-in:
+the default block access remains virtio-blk and THP backing is disabled.
+The immutable ext4 base is privately mapped with discard-writes, mounted
+read-only with DAX inside Kata, and still covered by the existing writable
+tmpfs upper. HOME remains virtio-fs. The RAM option uses a per-VM tmpfs mount
+with `huge=within_size`, unchanged guest RAM bytes, and a private backing file;
+it does not change node-wide THP policy, reserve hugetlb pages, add vCPUs, or
+disable security mitigations. Unsupported configurations fail activation.
+
+To package this combination, add `--build-arg BLOCK_ROOTFS_ACCESS=virtio-pmem`
+and `--build-arg GUEST_MEMORY_THP=1` to the block-image build above. Keep worker
+capacity and memory headroom explicit: the measured comparison used a total
+worker CPU limit of 1,250m and a 1,000m Actor leaf, not an extra vCPU. Dirty
+private-mapping pages count against the existing worker memory cgroup.
+Verify actual `ShmemPmdMapped` rather than assuming the RAM mount option took
+effect. Sandbox teardown removes the backing mount. See
+[the measured optimization decisions](performance.md) for paired results,
+rejected alternatives, durability checks, and the remaining initialization gap.
+
 ## Azure development validation
 
 Use the existing resources and security constraints in `resources.dev.md`.

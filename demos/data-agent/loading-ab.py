@@ -35,7 +35,8 @@ def counters():
             while location != Path('/sys/fs/cgroup') and location.is_relative_to('/sys/fs/cgroup'):
                 paths.append(location)
                 location = location.parent
-    result = {'membership': membership, 'guest_cpu': Path('/proc/stat').read_text().splitlines()[0]}
+    result = {'membership': membership, 'guest_cpu': Path('/proc/stat').read_text().splitlines()[0],
+              'diskstats': Path('/proc/diskstats').read_text()}
     for location in paths:
         for name in ('cpu.max', 'cpu.stat', 'cpu.pressure', 'memory.max', 'memory.current', 'memory.events'):
             path = location / name
@@ -183,6 +184,10 @@ def profile_app(environment):
         'lifetime_user_ms': (after.ru_utime - before.ru_utime) * 1000,
         'lifetime_system_ms': (after.ru_stime - before.ru_stime) * 1000,
         'maxrss_kib': after.ru_maxrss,
+        'minor_faults': after.ru_minflt - before.ru_minflt,
+        'major_faults': after.ru_majflt - before.ru_majflt,
+        'voluntary_switches': after.ru_nvcsw - before.ru_nvcsw,
+        'involuntary_switches': after.ru_nivcsw - before.ru_nivcsw,
     }
 
 
@@ -286,6 +291,8 @@ if __name__ == '__main__':
         def emit(record):
             output.write(json.dumps(record, sort_keys=True) + '\n')
             output.flush()
+            if os.environ.get('LOADING_AB_STDOUT') == '1':
+                print('LOADING_AB_RECORD ' + json.dumps(record, sort_keys=True), flush=True)
         try:
             run(emit)
         except Exception as error:

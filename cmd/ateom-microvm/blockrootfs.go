@@ -40,6 +40,13 @@ func defaultRootfsBackend() string {
 	return "virtio-fs"
 }
 
+func defaultBlockRootfsAccess() string {
+	if access := os.Getenv("ATE_MICROVM_BLOCK_ROOTFS_ACCESS"); access != "" {
+		return access
+	}
+	return "virtio-blk"
+}
+
 func blockRootfsKey(bundle string, sizeMiB int) (string, error) {
 	spec, err := imagecache.ReadSpec(bundle)
 	if err != nil {

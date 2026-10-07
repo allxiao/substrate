@@ -15,6 +15,7 @@
 package kata
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -52,5 +53,22 @@ func TestBlockRootfsStoragesRejectsUnsafeInputs(t *testing.T) {
 	}
 	if _, _, err := BlockRootfsStorages("agent", "/dev/vdb", 0); err == nil {
 		t.Fatal("accepted unbounded upper")
+	}
+}
+
+func TestBlockRootfsPmemIsReadOnlyDAX(t *testing.T) {
+	for index := range 25 {
+		storages, _, err := BlockRootfsStorages("agent", fmt.Sprintf("/dev/pmem%d", index), 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if storages[0].Driver != "blk" || !reflect.DeepEqual(storages[0].Options, []string{"ro", "noload", "dax=always"}) {
+			t.Fatalf("unsafe pmem storage: %+v", storages[0])
+		}
+	}
+	for _, device := range []string{"/dev/pmem25", "/dev/pmem-1", "/dev/pmem01", "/dev/pmem0/../1", "/dev/pmem"} {
+		if _, _, err := BlockRootfsStorages("agent", device, 64); err == nil {
+			t.Fatalf("noncanonical pmem path accepted: %s", device)
+		}
 	}
 }

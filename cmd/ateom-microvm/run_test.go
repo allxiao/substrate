@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"path/filepath"
@@ -29,6 +30,26 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 )
+
+func TestTHPMemoryConfigKeepsGuestBudget(t *testing.T) {
+	config := thpMemoryConfig("/run/vc/vm/test/memory/ram", 384)
+	if config.Size != 0 || config.Shared || len(config.Zones) != 1 || config.Zones[0].Size != 384*1024*1024 || !config.Zones[0].Shared {
+		t.Fatalf("invalid memory budget: %+v", config)
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"file":"/run/vc/vm/test/memory/ram"`) {
+		t.Fatalf("missing backing: %s", data)
+	}
+}
+
+func TestTHPMemoryRejectsExistingDirectory(t *testing.T) {
+	if _, err := prepareTHPMemory(t.TempDir(), 384); err == nil {
+		t.Fatal("reused existing mount directory")
+	}
+}
 
 // A vsock socket that has gone missing means cloud-hypervisor stopped the VM
 // (it unlinks the socket in the vsock device's shutdown), so the poll must give

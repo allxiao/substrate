@@ -72,6 +72,8 @@ var (
 	blockRootfsImageMiB = pflag.Int("block-rootfs-image-mib", 1024, "Capacity of each cached application ext4 image in MiB.")
 	blockRootfsUpperMiB = pflag.Int("block-rootfs-upper-mib", 64, "Maximum guest tmpfs writable application upper size in MiB.")
 	blockRootfsMkfs     = pflag.String("block-rootfs-mkfs", "mkfs.ext4", "Filesystem builder required when virtio-blk rootfs is selected.")
+	blockRootfsAccess   = pflag.String("block-rootfs-access", defaultBlockRootfsAccess(), "Immutable ext4 access: virtio-blk or virtio-pmem. Pmem uses discard-writes private mapping and guest read-only DAX.")
+	guestMemoryTHP      = pflag.Bool("guest-memory-thp", os.Getenv("ATE_MICROVM_GUEST_MEMORY_THP") == "1", "Use a per-VM tmpfs huge=within_size RAM backing, without changing node THP policy. Requires Data-only block rootfs.")
 
 	otlpRelaySocket = pflag.String("otlp-relay-socket", nodepath.AteletOTLPSocketPath(),
 		"Unix socket of atelet's OTLP relay to export telemetry through, keeping it off the pod network. Empty, or absent at startup, exports directly to OTEL_EXPORTER_OTLP_ENDPOINT instead.")
@@ -97,6 +99,12 @@ func main() {
 }
 
 func do(ctx context.Context) error {
+	if *guestMemoryTHP && *rootfsBackend != "virtio-blk" {
+		return fmt.Errorf("guest memory THP requires Data-only block rootfs")
+	}
+	if *blockRootfsAccess != "virtio-blk" && *blockRootfsAccess != "virtio-pmem" {
+		return fmt.Errorf("unsupported block rootfs access %q", *blockRootfsAccess)
+	}
 	if *rootfsBackend != "virtio-fs" && *rootfsBackend != "virtio-blk" {
 		return fmt.Errorf("unsupported rootfs backend %q", *rootfsBackend)
 	}
@@ -245,6 +253,8 @@ func do(ctx context.Context) error {
 	ateomService.blockImageMiB = *blockRootfsImageMiB
 	ateomService.blockUpperMiB = *blockRootfsUpperMiB
 	ateomService.blockMkfs = *blockRootfsMkfs
+	ateomService.blockAccess = *blockRootfsAccess
+	ateomService.memoryTHP = *guestMemoryTHP
 
 	svr := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
@@ -382,6 +392,8 @@ type AteomService struct {
 	blockImageMiB int
 	blockUpperMiB int
 	blockMkfs     string
+	blockAccess   string
+	memoryTHP     bool
 }
 
 var _ ateompb.AteomServer = (*AteomService)(nil)
