@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 	"testing"
@@ -32,9 +33,30 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateomcapacity"
 	"github.com/agent-substrate/substrate/internal/deviceplugin"
 	"github.com/agent-substrate/substrate/internal/installdefaults"
+	"github.com/agent-substrate/substrate/internal/microvmpreboot"
 	"github.com/agent-substrate/substrate/internal/nodepath"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 )
+
+func TestWorkerPrebootEnvReservesBoundedResources(t *testing.T) {
+	wp := &atev1alpha1.WorkerPool{Spec: atev1alpha1.WorkerPoolSpec{SandboxClass: atev1alpha1.SandboxClassMicroVM, MicroVMPreboot: &atev1alpha1.MicroVMPrebootSpec{SandboxConfigName: "kata", Count: 1, CPUMilli: 1000, MemoryMiB: 512}, Template: &atev1alpha1.WorkerPoolPodTemplate{Resources: &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1250m"), corev1.ResourceMemory: resource.MustParse("1Gi")}}}}}
+	sandbox := &atev1alpha1.SandboxConfig{Spec: atev1alpha1.SandboxConfigSpec{SandboxClass: atev1alpha1.SandboxClassMicroVM, Assets: map[string]map[string]atev1alpha1.AssetFile{"amd64": {}}}}
+	for _, name := range []string{"cloud-hypervisor", "virtiofsd", "kata-kernel", "kata-image"} {
+		sandbox.Spec.Assets["amd64"][name] = atev1alpha1.AssetFile{SHA256: strings.Repeat("a", 64)}
+	}
+	env, err := workerPrebootEnv(wp, sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config microvmpreboot.Config
+	if err := json.Unmarshal([]byte(*env.Value), &config); err != nil || config.Spec.Count != 1 {
+		t.Fatalf("config=%+v err=%v", config, err)
+	}
+	wp.Spec.Template.Resources.Limits[corev1.ResourceCPU] = resource.MustParse("1")
+	if _, err := workerPrebootEnv(wp, sandbox); err == nil {
+		t.Fatal("unbudgeted background CPU accepted")
+	}
+}
 
 func TestBuildDeploymentApplyConfig(t *testing.T) {
 	requiredNodeAffinity := &corev1.NodeAffinity{

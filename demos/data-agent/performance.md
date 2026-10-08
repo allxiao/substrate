@@ -1,6 +1,6 @@
 # Agent 启动性能分析
 
-更新日期：2026-10-06。
+更新日期：2026-10-07。
 
 本文记录 mtime/virtio-blk 基线及随后六轮优化决策。最终保留 **只读 pmem/DAX + 单 VM THP RAM backing**；热文件读取已达到原生 Pod 量级，完整 Agent 初始化仍约慢 28%，不宣称完全等价。旧实验配置见 [Azure 验证报告](azure-verification.md)，最新同轮结果和停止依据见本文末尾。
 
@@ -195,6 +195,49 @@ pmem 使用 VMM `discard_writes=true` 私有映射，Guest lower `ro,noload,dax=
 pmem 的私有映射保证 Guest 修改不会写回共享基盘；CoW 脏页和 THP 实际驻留仍计入既有 worker 内存 cgroup。映射 1-GiB 基盘不等于额外驻留 1 GiB，也不应把相同声明内存误称为与 Pod 完全相同的有效内存或严格的新 Actor 级内存隔离保证。Full checkpoint/restore 仍不支持块模式，默认 virtio-fs 路径不变。
 
 所有实验启用仅在临时独立 worker 池；89 个临时 Actor、对应模板和全部实验池已按确切创建名白名单清理，Responses port-forward 已关闭。原始三个 data-agent worker 的 Pod 名、镜像和 1-CPU 上限均未修改，原有 Actor UUID/Data 快照/SUSPENDED 状态及 denied-upload guard 保留，组件健康。Go scoped race/vet/lint、14 个 Python 测试通过。全仓 `make verify` 未重复运行，前轮已记录的不相关 CSI 测试/脏工作区生成物门禁仍是全仓验证边界。
+
+## WorkerPool MicroVM Preboot (2026-10-07)
+
+实现位置是 **WorkerPool 配置 + WorkerPod 内 ateom 维护**，不是控制面持有 VM。新增 `spec.microVMPreboot` 引用 SandboxConfig，指定单 worker 的空闲 VM 数、Actor CPU/内存规格；controller 解析内容哈希并写入 Pod env，引用资产变化会触发滚动更新。atelet 继续使用已有 SandboxConfig 资产下载/校验预热流程，没有新凭据或下载捷径。
+
+Worker 启动时先准备空共享目录、独立 cgroup、virtiofsd、VMM、Guest kernel/RAM，并等待 kata-agent。初始空闲池满足配置后再开放 worker readiness。真实验证中，尚未创建测试 Actor 时日志已出现 `Preboot VM ready`；最初 worker 引导至该日志约 0.54 s。控制面 Worker/capacity 注册仍是独立步骤，Pod Ready 不等于已能调度 Actor。
+
+空 VM 不接入 Actor 网络、不绑定 HOME/CSI/system-info、不创建用户容器。领取前匹配全部运行时资产及实际 RAM/vCPU；领取后迁入 Actor cgroup，热插拔 app disk/pmem 和 tap，按预期 MAC/设备节点有界等待 Guest 驱动，再晚绑定 volumes、创建 Kata sandbox 和用户进程。session/env 仍由原 Actor spec 注入。使用过的 VM 永不回池；Data suspend/失败/worker shutdown 清理其运行目录、THP mount、进程和 share。运行目录 ID 与 Full snapshot 的冻结 baseID 分开，避免清理其他 VM 的 lineage 目录。
+
+待机数上限 4，单 worker 串行引导，后台 cgroup 最多 250m CPU。待机内存按 `count × memoryMiB` 预留，主动报告容量会扣除待机内存和 250m CPU。测试仍为 Worker **1.25 CPU / 1 GiB**，Actor **1 CPU / 512 MiB**，Guest **384 MiB**；因此可报告 Actor 容量为 **1 CPU / 512 MiB**。这是用原 worker headroom 承担一台待机 VM，并非预热零内存成本。没有修改节点全局 THP、安全缓解、私有 ACR 或 Azure 身份。
+
+### 补充时机与最终 A/B
+
+初版领取后立即补充，在固定 CPU 上限下与用户初始化竞争：入口前 p50 216→43 ms，但完整 Run 收益很小。最终改为领取流程成功或失败清理结束后再触发补充；race 测试验证初始化期间不会补充。
+
+最终同代码、同 Agent digest、同 node1、同声明资源，五组交替新 Actor，对照池只关闭预热。每个 warm 样本都断言对应 VM 的 Ready 时间早于 Actor Create 时间，并验证实际 parent quota 125000/100000、Actor quota 100000/100000。
+
+| 指标，ms | 不预热 p50 | 预热 p50 |
+| --- | --- | --- |
+| worker RunWorkload 开始至用户 entrypoint | **215.300** | **28.025** |
+| worker 原生 RunWorkload 至真实 Ready | **1958.110** | **1812.087** |
+| 用户 entrypoint→监听 | 1726.768 | 1703.870 |
+| CLI Resume 全程 | 5614.955 | 5463.390 |
+
+入口前约减少 **187 ms / 87%**，原生 Run 约减少 **146 ms / 7.5%**。入口前值由同样本 worker RPC 日志时间/耗时与 Guest entrypoint marker 推导，依赖 Guest/host 时钟对齐；不是独立硬件 trace。CLI 含自动 port-forward 等固定成本，不是裸 API latency。只前置通用 VM 引导，镜像 rootfs 准备、Azure HOME 下载、证书/网络绑定和用户初始化仍不能全部移出 Create/Resume；不能把先前 Stage A 的整体 envelope 都称为已消除。
+
+| 样本 | 不预热入口前 | 预热入口前 | 不预热 Run | 预热 Run |
+| --- | --- | --- | --- | --- |
+| 1 | 225.643 | 27.266 | 1962.514 | 1806.133 |
+| 2 | 215.400 | 29.715 | 1895.496 | 1815.142 |
+| 3 | 204.518 | 28.025 | 1910.428 | 1818.249 |
+| 4 | 209.619 | 32.229 | 1961.504 | 1810.493 |
+| 5 | 215.300 | 18.281 | 1958.110 | 1812.087 |
+
+### 生命周期验收与边界
+
+真实验证了创建前 VM、单次领取、补充、250m→Actor 1-CPU cgroup 迁移、Guest 真正 Ready、连续 Data 恢复、node2→node1 及最终 node1→node2 的 Azure HOME 恢复。七次查询和多次恢复后都校验前五条历史、稳定 Actor UUID、不同 Guest/进程 boot。正常 Agent 镜像检查已有文件 copy-up、新 root marker 可写且恢复前不存在；基盘原始 app SHA 不变。毁掉未领取的空 VM 后能生成不同 ID 的替代 VM，运行中的 VM、Guest 本地 Responses 和 HOME 仍可用。
+
+初次恢复暴露网卡热插拔 API 返回早于 Guest device 创建，已通过等待预期 MAC 修复，后续连续恢复通过。另发现**空闲后 native ingress keep-alive POST 偶发超时**：同代码不预热对照也复现，GET 与 Guest 本地 POST 正常，关闭连接曾恢复但未完全消除。这不是已修复事项；本轮未扩大到 ingress 重构。最终默认入口的故障注入后 POST 验收仍受该问题限制，不能声称所有端到端故障场景已通过。文件/历史/VM 维护证据与入口传输证据分别保留。
+
+实测 worker digest `6c55ab32d08d523bc358f272ebb3aa107009d5b5176a18e6687cd9777e097275`；controller digest `d62de555066c885bafb47eca6fe617caf03c40292ab6bc413954399c0849664f`。实测后源码另外增加了领取前的短时 Running 检查，避免健康轮询与领取之间的退出竞态；此护栏已通过 scoped race/vet/lint，以上五组数字对应护栏添加前版本，不能混淆版本。
+
+最终发布 worker 为 `menxiaosubstrate1005.azurecr.io/substrate/ateom-microvm@sha256:89defde0cc5826c6de9adf87405c10e270d528de5236ed9b62a6f9850e1b474b`，最终镜像另做了领取、可写文件和 Data 销毁 canary，未重跑五组计时。24 个临时 Actor、3 个模板和2个池已按确切名称清理，验证期间更新的 controller 镜像和 ClusterRole 已恢复，原始三个 data-agent worker 未切换，Responses port-forward 已关闭。新增 CRD 字段保留为 additive schema；重新启用需部署上列新版 controller、安装随源码更新的只读 SandboxConfig 权限及使用最终 worker 镜像。
 
 ## 相关记录
 

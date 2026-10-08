@@ -129,6 +129,21 @@ func (c *Client) CreateVM(ctx context.Context, cfg VmConfig) error {
 }
 
 // BootVM boots a created VM via /api/v1/vm.boot (transitions Created -> Running).
+func (c *Client) AddDisk(ctx context.Context, disk DiskConfig) error {
+	return c.api.put(ctx, "/api/v1/vm.add-disk", disk)
+}
+
+func (c *Client) Running(ctx context.Context) bool {
+	var info struct {
+		State string `json:"state"`
+	}
+	return c.api.getJSON(ctx, "/api/v1/vm.info", &info) == nil && info.State == "Running"
+}
+
+func (c *Client) AddPmem(ctx context.Context, pmem PmemConfig) error {
+	return c.api.put(ctx, "/api/v1/vm.add-pmem", pmem)
+}
+
 func (c *Client) BootVM(ctx context.Context) error {
 	if err := c.api.put(ctx, "/api/v1/vm.boot", nil); err != nil {
 		return fmt.Errorf("vm.boot: %w", err)

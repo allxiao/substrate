@@ -77,6 +77,30 @@ type WorkerPoolPodTemplate struct {
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
+type MicroVMPrebootSpec struct {
+	// SandboxConfigName selects the cluster-scoped microVM runtime assets.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	SandboxConfigName string `json:"sandboxConfigName"`
+	// Count is the number of unused booted VMs maintained per worker.
+	// +required
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=4
+	Count int32 `json:"count"`
+	// CPUMilli is the Actor CPU limit whose rounded-up vCPU count is prebooted.
+	// +required
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=32000
+	CPUMilli int64 `json:"cpuMilli"`
+	// MemoryMiB is the Actor memory budget including the runtime reserve.
+	// +required
+	// +kubebuilder:validation:Minimum=256
+	// +kubebuilder:validation:Maximum=32768
+	MemoryMiB int32 `json:"memoryMiB"`
+}
+
+// +kubebuilder:validation:XValidation:rule="!has(self.microVMPreboot) || self.sandboxClass == 'microvm'",message="microVMPreboot requires microvm sandboxClass"
 type WorkerPoolSpec struct {
 	// Replicas is the number of worker pods to run.
 	// +required
@@ -105,6 +129,10 @@ type WorkerPoolSpec struct {
 	// +kubebuilder:validation:Enum=gvisor;microvm
 	// +kubebuilder:default=gvisor
 	SandboxClass SandboxClass `json:"sandboxClass,omitempty"`
+
+	// MicroVMPreboot maintains single-use empty VMs before Actor activation.
+	// +optional
+	MicroVMPreboot *MicroVMPrebootSpec `json:"microVMPreboot,omitempty"`
 }
 
 type WorkerPoolStatus struct {

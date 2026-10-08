@@ -105,6 +105,55 @@ effect. Sandbox teardown removes the backing mount. See
 [the measured optimization decisions](performance.md) for paired results,
 rejected alternatives, durability checks, and the remaining initialization gap.
 
+## Optional WorkerPool MicroVM Preboot
+
+An updated controller and worker can maintain single-use empty VMs before
+Actor creation. Enable it on a dedicated microVM WorkerPool:
+
+```yaml
+spec:
+  sandboxClass: microvm
+  microVMPreboot:
+    sandboxConfigName: microvm
+    count: 1
+    cpuMilli: 1000
+    memoryMiB: 512
+  template:
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        cpu: 1250m
+        memory: 1Gi
+```
+
+`memoryMiB` is the Actor budget including the existing VMM reserve, not
+additional Guest RAM. The controller resolves the SandboxConfig's asset
+hashes, passes them to the worker, and rolls the pool when they change.
+Atelet's existing asset prewarmer supplies the verified node cache. Workers
+wait for the configured empty VMs before startup readiness; capacity
+registration remains separate. Use a worker image built from this revision.
+
+Each empty VM has its own runtime directory, shared filesystem and cgroup,
+but no Actor network, HOME, session or user process. Activation claims a
+matching VM once, moves its processes into the Actor cgroup, attaches the
+application disks and independent network, and stages Actor volumes. Only
+then does Kata start the user containers and check their actual readiness.
+Replenishment starts after that activation finishes, avoiding competition
+with application initialization. Used or failed-bound VMs never return to
+the pool; shutdown and Data suspend destroy them. Full restore still follows
+the snapshot path rather than claiming an empty VM.
+
+Pool size is bounded at 1-4. Asset or RAM/vCPU mismatch, an empty pool, or a
+VM already dead at claim falls back to the normal cold path. Idle failures
+are health-checked and replaced. The example reserves 512 MiB and 250m for
+standby/background work, so advertised Actor capacity is 512 MiB / 1 CPU.
+Both standby and Actor resources remain inside the worker's existing limits;
+raising the standby count requires an explicit matching worker budget.
+
+See [preboot measurements and verification limits](performance.md#workerpool-microvm-preboot-2026-10-07).
+
 ## Azure development validation
 
 Use the existing resources and security constraints in `resources.dev.md`.

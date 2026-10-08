@@ -16,6 +16,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"go.opentelemetry.io/otel"
@@ -28,10 +29,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/agent-substrate/substrate/internal/ateattr"
+	"github.com/agent-substrate/substrate/internal/microvmpreboot"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 )
 
 const workerPoolFieldOwner = "workerpool-controller"
@@ -67,6 +72,7 @@ type WorkerPoolReconciler struct {
 }
 
 //+kubebuilder:rbac:groups=ate.dev,resources=workerpools,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=ate.dev,resources=sandboxconfigs,verbs=get;list;watch
 //+kubebuilder:rbac:groups=ate.dev,resources=workerpools/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=ate.dev,resources=workerpools/finalizers,verbs=update
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
@@ -126,6 +132,17 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alp
 		TracesSampler:        r.OTelTracesSampler,
 		TracesSamplerArg:     r.OTelTracesSamplerArg,
 	}, r.SystemNamespace, r.AteletServiceAccount, r.RouterServiceAccount)
+	if wp.Spec.MicroVMPreboot != nil {
+		config := &atev1alpha1.SandboxConfig{}
+		if err := r.Get(ctx, types.NamespacedName{Name: wp.Spec.MicroVMPreboot.SandboxConfigName}, config); err != nil {
+			return fmt.Errorf("preboot SandboxConfig: %w", err)
+		}
+		env, err := workerPrebootEnv(wp, config)
+		if err != nil {
+			return err
+		}
+		depAC.Spec.Template.Spec.Containers[0].WithEnv(env)
+	}
 	if err := r.Apply(ctx, depAC, client.FieldOwner(workerPoolFieldOwner), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply Deployment: %w", err)
 	}
@@ -153,6 +170,50 @@ func (r *WorkerPoolReconciler) syncStatus(ctx context.Context, wp *atev1alpha1.W
 	}
 
 	return nil
+}
+
+func workerPrebootEnv(wp *atev1alpha1.WorkerPool, sandbox *atev1alpha1.SandboxConfig) (*corev1ac.EnvVarApplyConfiguration, error) {
+	if wp.Spec.SandboxClass != atev1alpha1.SandboxClassMicroVM || sandbox.Spec.SandboxClass != atev1alpha1.SandboxClassMicroVM {
+		return nil, fmt.Errorf("preboot requires a microvm worker and SandboxConfig")
+	}
+	config := microvmpreboot.Config{Spec: *wp.Spec.MicroVMPreboot, Assets: map[string]map[string]string{}}
+	for arch, assets := range sandbox.Spec.Assets {
+		config.Assets[arch] = map[string]string{}
+		for name, asset := range assets {
+			config.Assets[arch][name] = asset.SHA256
+		}
+		if _, err := config.Paths(arch); err != nil {
+			return nil, err
+		}
+	}
+	if len(config.Assets) == 0 || wp.Spec.Template == nil || wp.Spec.Template.Resources == nil {
+		return nil, fmt.Errorf("preboot requires runtime assets and explicit worker CPU/memory limits")
+	}
+	limits := wp.Spec.Template.Resources.Limits
+	cpu, memory := limits["cpu"], limits["memory"]
+	if cpu.MilliValue() < config.Spec.CPUMilli+microvmpreboot.BackgroundCPUMilli || memory.Value() < config.ReservedMemoryBytes()+int64(config.Spec.MemoryMiB)*1024*1024 {
+		return nil, fmt.Errorf("worker limits must cover idle preboot VMs, one matching Actor, and 250m background CPU")
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		return nil, err
+	}
+	return corev1ac.EnvVar().WithName(microvmpreboot.EnvName).WithValue(string(data)), nil
+}
+
+func (r *WorkerPoolReconciler) prebootConfigUsers(ctx context.Context, object client.Object) []reconcile.Request {
+	var pools atev1alpha1.WorkerPoolList
+	if err := r.List(ctx, &pools); err != nil {
+		log.FromContext(ctx).Error(err, "List preboot WorkerPools")
+		return nil
+	}
+	var requests []reconcile.Request
+	for _, pool := range pools.Items {
+		if pool.Spec.MicroVMPreboot != nil && pool.Spec.MicroVMPreboot.SandboxConfigName == object.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}})
+		}
+	}
+	return requests
 }
 
 // InitMetrics initializes the OpenTelemetry instruments for ate.workerpool.desired_workers
@@ -213,5 +274,6 @@ func (r *WorkerPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&atev1alpha1.WorkerPool{}).
 		Owns(&appsv1.Deployment{}).
+		Watches(&atev1alpha1.SandboxConfig{}, handler.EnqueueRequestsFromMapFunc(r.prebootConfigUsers)).
 		Complete(r)
 }

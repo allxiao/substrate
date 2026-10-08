@@ -32,6 +32,28 @@ func TestSnapshotURL(t *testing.T) {
 	}
 }
 
+func TestPrebootHotplugPreservesImmutableDisks(t *testing.T) {
+	client, fake := startFakeCH(t)
+	if err := client.AddPmem(t.Context(), PmemConfig{File: "/cache/base.ext4", Size: 1024 * 1024 * 1024, DiscardWrites: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.AddDisk(t.Context(), DiskConfig{Path: "/cache/base.ext4", Readonly: true, ImageType: "Raw", NumQueues: 1, QueueSize: 1024}); err != nil {
+		t.Fatal(err)
+	}
+	requests := fake.recorded()
+	if len(requests) != 2 || requests[0].path != "/api/v1/vm.add-pmem" || requests[1].path != "/api/v1/vm.add-disk" {
+		t.Fatalf("wrong hotplug requests: %+v", requests)
+	}
+	var pmem PmemConfig
+	var disk DiskConfig
+	if err := json.Unmarshal([]byte(requests[0].body), &pmem); err != nil || !pmem.DiscardWrites {
+		t.Fatalf("unsafe pmem: %+v %v", pmem, err)
+	}
+	if err := json.Unmarshal([]byte(requests[1].body), &disk); err != nil || !disk.Readonly {
+		t.Fatalf("unsafe disk: %+v %v", disk, err)
+	}
+}
+
 // fakeCH is a stand-in cloud-hypervisor REST server on a unix socket. It records
 // the requests it receives so tests can assert on method/path/body.
 type fakeCH struct {

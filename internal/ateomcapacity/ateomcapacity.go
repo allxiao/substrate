@@ -105,6 +105,30 @@ func readLimit(path string) int64 {
 }
 
 // ReportConfig is what an ateom needs to reach the atelet on its node.
+func subtractReservation(request *ateletpb.SetWorkerCapacityRequest, cpuMilli, memoryBytes int64) error {
+	if cpuMilli < 0 || memoryBytes < 0 {
+		return fmt.Errorf("negative worker capacity reservation")
+	}
+	remaining := map[string]int64{}
+	for _, limit := range request.GetCapacity().GetResources().GetLimits() {
+		quantity, err := resource.ParseQuantity(limit.GetQuantity())
+		if err != nil {
+			return err
+		}
+		if limit.GetName() == resources.ResourceCPU {
+			remaining[limit.GetName()] = quantity.MilliValue() - cpuMilli
+		} else if limit.GetName() == resources.ResourceMemory {
+			remaining[limit.GetName()] = quantity.Value() - memoryBytes
+		}
+	}
+	if remaining[resources.ResourceCPU] <= 0 || remaining[resources.ResourceMemory] <= 0 {
+		return fmt.Errorf("worker limits do not cover preboot reservation and Actors")
+	}
+	request.Capacity.Resources = cpuMemory(remaining[resources.ResourceCPU], remaining[resources.ResourceMemory])
+	return nil
+}
+
+// ReportConfig is what an ateom needs to reach the atelet on its node.
 type ReportConfig struct {
 	SocketPath           string
 	CredentialBundlePath string
@@ -114,7 +138,9 @@ type ReportConfig struct {
 	// than derived from the downward API.
 	AteletSPIFFEID string
 	// Actors is how many actors this ateom will host at once.
-	Actors int
+	Actors              int
+	ReservedCPUMilli    int64
+	ReservedMemoryBytes int64
 }
 
 // Report tells the node-local atelet what this ateom can supply, retrying
@@ -130,6 +156,11 @@ func Report(ctx context.Context, cfg ReportConfig) error {
 		return fmt.Errorf("capacity report: %w", err)
 	}
 	capacity := FromFiles(cfg.Actors)
+	if cfg.ReservedCPUMilli != 0 || cfg.ReservedMemoryBytes != 0 {
+		if err := subtractReservation(capacity, cfg.ReservedCPUMilli, cfg.ReservedMemoryBytes); err != nil {
+			return err
+		}
+	}
 	err = retryReport(ctx, func() error {
 		return reportOnce(ctx, cfg.SocketPath, tlsConfig, capacity)
 	}, initialReportBackoff)

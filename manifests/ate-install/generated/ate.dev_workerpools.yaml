@@ -68,6 +68,43 @@ spec:
           spec:
             description: spec defines the desired state of WorkerPool
             properties:
+              microVMPreboot:
+                description: MicroVMPreboot maintains single-use empty VMs before
+                  Actor activation.
+                properties:
+                  count:
+                    description: Count is the number of unused booted VMs maintained
+                      per worker.
+                    format: int32
+                    maximum: 4
+                    minimum: 1
+                    type: integer
+                  cpuMilli:
+                    description: CPUMilli is the Actor CPU limit whose rounded-up
+                      vCPU count is prebooted.
+                    format: int64
+                    maximum: 32000
+                    minimum: 1
+                    type: integer
+                  memoryMiB:
+                    description: MemoryMiB is the Actor memory budget including the
+                      runtime reserve.
+                    format: int32
+                    maximum: 32768
+                    minimum: 256
+                    type: integer
+                  sandboxConfigName:
+                    description: SandboxConfigName selects the cluster-scoped microVM
+                      runtime assets.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                required:
+                - count
+                - cpuMilli
+                - memoryMiB
+                - sandboxConfigName
+                type: object
               replicas:
                 description: Replicas is the number of worker pods to run.
                 format: int32
@@ -444,6 +481,9 @@ spec:
             - replicas
             - workerImage
             type: object
+            x-kubernetes-validations:
+            - message: microVMPreboot requires microvm sandboxClass
+              rule: '!has(self.microVMPreboot) || self.sandboxClass == ''microvm'''
           status:
             description: status is the observed state of WorkerPool
             properties:

@@ -371,6 +371,9 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, actorDirs *
 	// the upper-dir removal below (removing a live overlay's upperdir would
 	// corrupt the mount rather than delete the files).
 	s.cleanupSandboxState(ctx, id)
+	if ra != nil && ra.runtimeID != "" && ra.runtimeID != id {
+		s.cleanupSandboxState(ctx, ra.runtimeID)
+	}
 
 	// Remove the rootfs upper dir: ateom owns it — atelet's actor-dir reset
 	// doesn't know it — and its absence is what marks a worker as holding no

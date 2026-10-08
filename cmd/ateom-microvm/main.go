@@ -255,6 +255,13 @@ func do(ctx context.Context) error {
 	ateomService.blockMkfs = *blockRootfsMkfs
 	ateomService.blockAccess = *blockRootfsAccess
 	ateomService.memoryTHP = *guestMemoryTHP
+	prebootConfig, err := ateomService.startPreboot(ctx)
+	if err != nil {
+		return err
+	}
+	if ateomService.preboot != nil {
+		defer ateomService.preboot.close()
+	}
 
 	svr := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
@@ -276,6 +283,9 @@ func do(ctx context.Context) error {
 		sig := <-sigCh
 		slog.InfoContext(ctx, "Received signal; beginning graceful shutdown", slog.String("signal", sig.String()))
 		readiness.MarkNotReady()
+		if ateomService.preboot != nil {
+			ateomService.preboot.close()
+		}
 		// Use a fresh context: the do() context is torn down on return, but the
 		// shutdown must outlive it until the guest has stopped and the VM is down.
 		ateomService.gracefulShutdown(context.Background())
@@ -296,6 +306,18 @@ func do(ctx context.Context) error {
 			TrustBundlePath:      tunnelConfig.TrustBundle,
 			AteletSPIFFEID:       tunnelConfig.BrokerIdentity,
 			Actors:               *maxActors,
+			ReservedCPUMilli: func() int64 {
+				if prebootConfig != nil {
+					return 250
+				}
+				return 0
+			}(),
+			ReservedMemoryBytes: func() int64 {
+				if prebootConfig != nil {
+					return prebootConfig.ReservedMemoryBytes()
+				}
+				return 0
+			}(),
 		})
 		if err != nil && ctx.Err() == nil {
 			serverboot.Fatal(ctx, "Failed to report worker capacity", err)
@@ -394,6 +416,7 @@ type AteomService struct {
 	blockMkfs     string
 	blockAccess   string
 	memoryTHP     bool
+	preboot       *prebootPool
 }
 
 var _ ateompb.AteomServer = (*AteomService)(nil)

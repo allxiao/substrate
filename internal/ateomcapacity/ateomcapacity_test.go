@@ -17,6 +17,7 @@ package ateomcapacity
 import (
 	"context"
 	"errors"
+	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,13 +25,29 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/protobuf/testing/protocmp"
-
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 )
 
 // testActors stands in for the ateom's own ceiling, which is a flag in
 // production rather than a constant here.
 const testActors = 7
+
+func TestPrebootReservationIsSubtracted(t *testing.T) {
+	request := &ateletpb.SetWorkerCapacityRequest{Capacity: &ateletpb.WorkerResources{Resources: cpuMemory(1250, 1024*1024*1024), Actors: 1}}
+	if err := subtractReservation(request, 250, 512*1024*1024); err != nil {
+		t.Fatal(err)
+	}
+	for _, limit := range request.Capacity.Resources.Limits {
+		if limit.Name == "cpu" && limit.Quantity != "1" {
+			t.Fatalf("wrong remaining CPU: %s", limit.Quantity)
+		}
+		if limit.Name == "memory" && limit.Quantity != "512Mi" {
+			t.Fatalf("wrong remaining memory: %s", limit.Quantity)
+		}
+	}
+	if err := subtractReservation(request, 1000, 0); err == nil {
+		t.Fatal("exhausted worker capacity accepted")
+	}
+}
 
 func TestFromFiles(t *testing.T) {
 	for _, tc := range []struct {

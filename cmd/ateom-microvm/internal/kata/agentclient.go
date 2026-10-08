@@ -50,7 +50,8 @@ func DebugConsoleDump(ctx context.Context, vsockPath, cmd string) string {
 		return "debug-console dial: " + err.Error()
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(8 * time.Second))
+	deadline, _ := dctx.Deadline()
+	_ = conn.SetDeadline(deadline)
 	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", debugConsoleVsockPort); err != nil {
 		return "debug-console CONNECT: " + err.Error()
 	}

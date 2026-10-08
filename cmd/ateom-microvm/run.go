@@ -58,7 +58,8 @@ type runningActor struct {
 	// actor it is the id read from the snapshot's base-id file (the golden id,
 	// propagated). CheckpointWorkload writes it back into the next snapshot's
 	// base-id file so the chain survives suspend->resume->suspend.
-	baseID string
+	baseID    string
+	runtimeID string
 
 	// ateom owns this CH process (booted at Run or relaunched at Restore).
 	chCmd *exec.Cmd
@@ -470,6 +471,19 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	}); err != nil {
 		return err
 	}
+	if s.preboot != nil {
+		key := prebootKey{kernel: kernel, image: image, vmm: rr.chBinary, virtiofsd: rr.virtiofsd, memoryMiB: memMiB, vcpus: vcpus}
+		if vm := s.preboot.take(key); vm != nil {
+			checkCtx, cancel := context.WithTimeout(ctx, time.Second)
+			running := ch.NewClient(vm.runtime.apiSocket).Running(checkCtx)
+			cancel()
+			if running {
+				return s.bindPreboot(ctx, p, ctrs, egress, vm)
+			}
+			s.disposePreboot(vm)
+			s.preboot.completeClaim()
+		}
+	}
 
 	// Clean stale per-sandbox state + create the runtime dir for the sockets.
 	s.cleanupSandboxState(ctx, actorUID)
@@ -758,37 +772,10 @@ func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime
 				{phaseTotal, time.Since(started)},
 			})
 	}()
-	upperBase := rootfsUpperDir(actorDirs)
-	for _, c := range ctrs {
-		if c.blockImage == "" {
-			if err := kata.StageMergedRootfs(ctx, c.bundleRootfs, upperBase, id, c.name); err != nil {
-				return nil, fmt.Errorf("while staging merged rootfs for %q: %w", c.name, err)
-			}
-		}
-		for _, vm := range c.imageMounts {
-			src := imagecache.ImageVolumeMountPath(c.bundle, vm.GetVolumeName())
-			if err := kata.StageImageVolume(ctx, src, id, c.name, vm.GetVolumeName()); err != nil {
-				return nil, fmt.Errorf("while staging image volume %q for %q: %w", vm.GetVolumeName(), c.name, err)
-			}
-		}
-	}
-	if hasDurableVolumes(containers) {
-		bindStarted := time.Now()
-		err := s.stageDurableVolumes(ctx, id, actorDirs.GetDurableDirVolumeMountsDir())
-		dDurableBind = time.Since(bindStarted)
-		if err != nil {
-			return nil, fmt.Errorf("while staging durable-dir volumes: %w", err)
-		}
-	}
-	if hasCsiVolumes(containers) {
-		if err := s.stageCsiVolumes(ctx, id, actorDirs.GetVolumesDir()); err != nil {
-			return nil, fmt.Errorf("while staging CSI volumes: %w", err)
-		}
-	}
-	if hasSystemInfoVolumes(containers) {
-		if err := s.stageSystemInfoVolumes(ctx, id, actorDirs.GetSystemInfoVolumeRootsDir()); err != nil {
-			return nil, fmt.Errorf("while staging system-info volumes: %w", err)
-		}
+	var err error
+	dDurableBind, err = s.stageActorShares(ctx, id, actorDirs, ctrs, containers)
+	if err != nil {
+		return nil, err
 	}
 	vfsdLog, _ := os.OpenFile(virtiofsdLogPath(id), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	virtiofsdStarted := time.Now()
@@ -804,6 +791,41 @@ func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime
 		return nil, fmt.Errorf("while starting virtiofsd: %w", err)
 	}
 	return vfsdCmd, nil
+}
+
+func (s *AteomService) stageActorShares(ctx context.Context, id string, actorDirs *ateompb.ActorDirs, ctrs []actorContainer, containers []*ateompb.Container) (time.Duration, error) {
+	upperBase := rootfsUpperDir(actorDirs)
+	for _, container := range ctrs {
+		if container.blockImage == "" {
+			if err := kata.StageMergedRootfs(ctx, container.bundleRootfs, upperBase, id, container.name); err != nil {
+				return 0, err
+			}
+		}
+		for _, volume := range container.imageMounts {
+			if err := kata.StageImageVolume(ctx, imagecache.ImageVolumeMountPath(container.bundle, volume.GetVolumeName()), id, container.name, volume.GetVolumeName()); err != nil {
+				return 0, err
+			}
+		}
+	}
+	var durable time.Duration
+	if hasDurableVolumes(containers) {
+		started := time.Now()
+		if err := s.stageDurableVolumes(ctx, id, actorDirs.GetDurableDirVolumeMountsDir()); err != nil {
+			return time.Since(started), err
+		}
+		durable = time.Since(started)
+	}
+	if hasCsiVolumes(containers) {
+		if err := s.stageCsiVolumes(ctx, id, actorDirs.GetVolumesDir()); err != nil {
+			return 0, err
+		}
+	}
+	if hasSystemInfoVolumes(containers) {
+		if err := s.stageSystemInfoVolumes(ctx, id, actorDirs.GetSystemInfoVolumeRootsDir()); err != nil {
+			return 0, err
+		}
+	}
+	return durable, nil
 }
 
 // guestConfig returns the default guest sizing and the agent kernel params, enabling

@@ -96,6 +96,26 @@ func (l *ActorLeaf) SysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(l.dir.Fd())}
 }
 
+func (l *ActorLeaf) Adopt(source string) error {
+	if l == nil {
+		return nil
+	}
+	path, err := actorLeafPath(Root, source)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
+	if err != nil {
+		return err
+	}
+	for _, pid := range strings.Fields(string(data)) {
+		if err := writeExisting(filepath.Join(l.dir.Name(), "cgroup.procs"), pid); err != nil {
+			return fmt.Errorf("moving preboot process %s: %w", pid, err)
+		}
+	}
+	return nil
+}
+
 // Close releases the leaf's handle. The leaf itself stays until
 // RemoveActorLeaf.
 func (l *ActorLeaf) Close() error {
